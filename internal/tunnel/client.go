@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,11 +24,21 @@ const (
 	// ReadBufferSize is the TCP read buffer size.
 	ReadBufferSize = 4096
 
-	// DrainWait is how long DrainPending waits for TCP backend data before
-	// returning a NOP response. Keep this well under typical resolver retry
-	// timeout (~500ms for Cloudflare) to avoid duplicate queries.
-	DrainWait = 100 * time.Millisecond
+	// DrainWait is how long DrainPending waits for its response from the
+	// dispatcher before returning NOP. Keep well under resolver retry timeout.
+	DrainWait = 300 * time.Millisecond
+
+	// dispatchInterval is how often the dispatcher checks for pending queries
+	// and data to match them up.
+	dispatchInterval = 10 * time.Millisecond
 )
+
+// drainSlot represents a pending DNS query waiting for TCP backend data.
+type drainSlot struct {
+	seq      uint16
+	maxBytes int
+	result   chan *protocol.Packet
+}
 
 // Client represents an authenticated dns2tcp tunnel client.
 type Client struct {
@@ -37,7 +48,6 @@ type Client struct {
 	Challenge string
 	IsAuthed  bool
 	Resource  string
-	NumSeq    uint16
 
 	// TCP connection to the backend resource.
 	tcpConn net.Conn
@@ -53,12 +63,25 @@ type Client struct {
 	// Guards against concurrent ConnectTCP calls (dns2tcpc sends =connect twice).
 	connecting bool
 
-	// Last sequence number whose data was forwarded to TCP backend.
-	// Used to deduplicate when DNS resolvers retry the same query.
-	lastFwdSeq uint16
+	// Incoming data queue: client data arrives out of order through DNS
+	// resolvers. Buffer by seq and flush to TCP in order, matching the
+	// original dns2tcp server's queue_flush_incoming_data behavior.
+	incomingBuf   map[uint16][]byte // seq -> data, waiting to be flushed
+	nextIncomSeq  uint16            // next seq to flush to TCP
+	incomSeqReady bool              // whether nextIncomSeq has been set
+
+	// Ordered dispatch: DNS handler goroutines register slots here.
+	// The dispatcher assigns data to slots sorted by seq (lowest first),
+	// matching the original dns2tcp C server's queue behavior.
+	slotsMu sync.Mutex
+	slots   []drainSlot
 
 	// Tracks whether the TCP connection has been closed.
 	isClosed bool
+
+	// Tracks whether the dispatcher goroutine is running.
+	dispatchOnce sync.Once
+	stopDispatch chan struct{}
 
 	logger *slog.Logger
 }
@@ -66,10 +89,10 @@ type Client struct {
 // NewClient creates a new unauthenticated client with the given session ID.
 func NewClient(sessionID uint16, logger *slog.Logger) *Client {
 	return &Client{
-		SessionID: sessionID,
-		NumSeq:    1,
-		dataReady: make(chan struct{}, 1),
-		logger:    logger.With("session_id", sessionID),
+		SessionID:    sessionID,
+		dataReady:    make(chan struct{}, 1),
+		stopDispatch: make(chan struct{}),
+		logger:       logger.With("session_id", sessionID),
 	}
 }
 
@@ -99,14 +122,13 @@ func (c *Client) ConnectTCP(target string) error {
 
 	c.logger.Info("tcp connection established", "target", target)
 
-	// Start background reader that pulls data from the TCP backend.
 	go c.readLoop()
+	c.dispatchOnce.Do(func() { go c.dispatcher() })
 
 	return nil
 }
 
 // readLoop reads data from the TCP backend and buffers it for DNS responses.
-// It signals dataReady so DrainPending can wake up and deliver the data.
 func (c *Client) readLoop() {
 	buf := make([]byte, ReadBufferSize)
 	for {
@@ -132,7 +154,7 @@ func (c *Client) readLoop() {
 	}
 }
 
-// signalDataReady wakes up any goroutine waiting in DrainPending.
+// signalDataReady wakes the dispatcher.
 func (c *Client) signalDataReady() {
 	select {
 	case c.dataReady <- struct{}{}:
@@ -140,9 +162,10 @@ func (c *Client) signalDataReady() {
 	}
 }
 
-// HandleData processes incoming TCP data from the client (received via DNS query)
-// and writes it to the backend TCP connection. The seq parameter deduplicates
-// retried queries from DNS resolvers.
+// HandleData buffers incoming client data (received via DNS query) indexed by
+// seq, then flushes to the TCP backend in order. This handles out-of-order
+// query arrival through DNS resolvers, matching the original dns2tcp server's
+// queue_flush_incoming_data behavior.
 func (c *Client) HandleData(seq uint16, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -154,76 +177,207 @@ func (c *Client) HandleData(seq uint16, data []byte) error {
 		return fmt.Errorf("tunnel: tcp connection closed")
 	}
 
-	// Deduplicate: resolver retries send the same query (same seq) again.
-	if seq != 0 && seq == c.lastFwdSeq {
-		c.logger.Debug("duplicate data seq, skipping forward", "seq", seq)
+	if len(data) == 0 {
 		return nil
 	}
-	c.lastFwdSeq = seq
 
-	if len(data) > 0 {
+	// Initialize incoming queue on first data.
+	if c.incomingBuf == nil {
+		c.incomingBuf = make(map[uint16][]byte)
+	}
+
+	// Deduplicate: resolver retries send the same query (same seq) again.
+	if _, dup := c.incomingBuf[seq]; dup {
+		c.logger.Debug("duplicate incoming seq, skipping", "seq", seq)
+		return nil
+	}
+
+	// Buffer this seq's data.
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	c.incomingBuf[seq] = buf
+
+	// Set base seq on first data query.
+	if !c.incomSeqReady {
+		c.nextIncomSeq = seq
+		c.incomSeqReady = true
+	}
+	// Update base if we see a lower seq (earlier packet arrived late).
+	if seqBefore(seq, c.nextIncomSeq) {
+		c.nextIncomSeq = seq
+	}
+
+	// Flush consecutive data to TCP in order.
+	return c.flushIncoming()
+}
+
+// flushIncoming writes buffered client data to TCP in seq order.
+// Must be called with c.mu held.
+func (c *Client) flushIncoming() error {
+	for {
+		data, ok := c.incomingBuf[c.nextIncomSeq]
+		if !ok {
+			return nil
+		}
+
 		if _, err := c.tcpConn.Write(data); err != nil {
 			return fmt.Errorf("tunnel: writing to tcp: %w", err)
 		}
-		c.logger.Debug("forwarded to tcp", "bytes", len(data), "seq", seq)
+		c.logger.Debug("forwarded to tcp", "bytes", len(data), "seq", c.nextIncomSeq)
+
+		delete(c.incomingBuf, c.nextIncomSeq)
+		c.nextIncomSeq++
+		if c.nextIncomSeq == 0 {
+			c.nextIncomSeq = 1
+		}
 	}
-	return nil
 }
 
-// DrainPending returns buffered data from the TCP backend (up to maxBytes)
-// and a response packet. This is called when the client sends a NOP or DATA query.
-//
-// If no data is available yet, it waits up to DrainWait for the readLoop to
-// buffer TCP backend data. This simulates the original dns2tcp C server's
-// behavior of queuing DNS requests and replying when TCP data arrives.
-func (c *Client) DrainPending(ackSeq uint16, maxBytes int) *protocol.Packet {
-	c.mu.Lock()
+// seqBefore returns true if a comes before b in the uint16 sequence space.
+func seqBefore(a, b uint16) bool {
+	return int16(a-b) < 0
+}
 
-	// If no pending data and connection still alive, wait briefly for TCP data.
-	if len(c.pendingData) == 0 && !c.isClosed {
-		c.mu.Unlock()
+// DrainPending registers a pending query slot and waits for the dispatcher to
+// assign data. The dispatcher processes slots in seq order (lowest first),
+// ensuring data chunks are mapped to the correct query slots for the client
+// to reassemble in the right order.
+func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
+	result := make(chan *protocol.Packet, 1)
+
+	c.slotsMu.Lock()
+	c.slots = append(c.slots, drainSlot{
+		seq:      clientSeq,
+		maxBytes: maxBytes,
+		result:   result,
+	})
+	c.slotsMu.Unlock()
+
+	// Wake dispatcher to process this slot.
+	c.signalDataReady()
+
+	select {
+	case pkt := <-result:
+		return pkt
+	case <-time.After(DrainWait):
+		// Timeout: remove our slot and return NOP.
+		c.removeSlot(clientSeq)
+		return &protocol.Packet{
+			SessionID: c.SessionID,
+			Seq:       clientSeq,
+			AckSeq:    0,
+			Type:      protocol.TypeACK | protocol.TypeNOP,
+		}
+	}
+}
+
+// removeSlot removes a timed-out slot from the pending list.
+func (c *Client) removeSlot(seq uint16) {
+	c.slotsMu.Lock()
+	defer c.slotsMu.Unlock()
+	for i, s := range c.slots {
+		if s.seq == seq {
+			c.slots = append(c.slots[:i], c.slots[i+1:]...)
+			return
+		}
+	}
+}
+
+// dispatcher runs in a background goroutine, matching pending data to
+// waiting query slots in seq order. This is the Go equivalent of the
+// original dns2tcp C server's queue_read_tcp + queue_reply system.
+func (c *Client) dispatcher() {
+	for {
 		select {
 		case <-c.dataReady:
-		case <-time.After(DrainWait):
+		case <-time.After(dispatchInterval):
+		case <-c.stopDispatch:
+			return
 		}
+
+		c.slotsMu.Lock()
+		nSlots := len(c.slots)
+		c.slotsMu.Unlock()
+
 		c.mu.Lock()
-	}
-	defer c.mu.Unlock()
+		hasData := len(c.pendingData) > 0 || c.isClosed
+		c.mu.Unlock()
 
-	pkt := &protocol.Packet{
-		SessionID: c.SessionID,
-		AckSeq:    ackSeq,
-		Seq:       c.NumSeq,
-		Type:      protocol.TypeACK,
-	}
-
-	if len(c.pendingData) > 0 {
-		n := len(c.pendingData)
-		if n > maxBytes {
-			n = maxBytes
+		if hasData && nSlots > 0 {
+			// Batch delay: wait for more queries to arrive through DNS
+			// resolvers before sorting and dispatching. dns2tcpc sends
+			// parallel queries that trickle in over ~5-20ms via Cloudflare.
+			// We need all queries in the batch registered before we can
+			// sort by seq and assign data to the correct slots.
+			time.Sleep(50 * time.Millisecond)
 		}
 
-		pkt.Payload = make([]byte, n)
-		copy(pkt.Payload, c.pendingData[:n])
-		c.pendingData = c.pendingData[n:]
-		pkt.Type = protocol.TypeACK | protocol.TypeData
-
-		c.logger.Debug("draining data", "bytes", n, "remaining", len(c.pendingData))
-	} else if c.isClosed {
-		pkt.Type = protocol.TypeDesauth
-	} else {
-		pkt.Type = protocol.TypeACK | protocol.TypeNOP
+		c.dispatchPending()
 	}
-
-	c.NumSeq++
-	if c.NumSeq == 0 {
-		c.NumSeq = 1 // skip zero, same as dns2tcp
-	}
-
-	return pkt
 }
 
-// Close shuts down the client's TCP connection.
+// dispatchPending assigns data chunks to waiting slots, lowest seq first.
+func (c *Client) dispatchPending() {
+	c.slotsMu.Lock()
+	defer c.slotsMu.Unlock()
+
+	if len(c.slots) == 0 {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hasData := len(c.pendingData) > 0
+	closed := c.isClosed
+
+	if !hasData && !closed {
+		return
+	}
+
+	// Sort by seq so data goes to the lowest seq first.
+	sort.Slice(c.slots, func(i, j int) bool {
+		return c.slots[i].seq < c.slots[j].seq
+	})
+
+	var remaining []drainSlot
+	for _, slot := range c.slots {
+		pkt := &protocol.Packet{
+			SessionID: c.SessionID,
+			Seq:       slot.seq,
+			AckSeq:    0,
+			Type:      protocol.TypeACK,
+		}
+
+		if len(c.pendingData) > 0 {
+			n := len(c.pendingData)
+			if n > slot.maxBytes {
+				n = slot.maxBytes
+			}
+			pkt.Payload = make([]byte, n)
+			copy(pkt.Payload, c.pendingData[:n])
+			c.pendingData = c.pendingData[n:]
+			pkt.Type = protocol.TypeACK | protocol.TypeData
+
+			c.logger.Debug("dispatch data", "seq", slot.seq, "bytes", n, "remaining", len(c.pendingData))
+		} else if closed {
+			pkt.Type = protocol.TypeDesauth
+		} else {
+			// No more data for remaining slots; keep them waiting.
+			remaining = append(remaining, slot)
+			continue
+		}
+
+		select {
+		case slot.result <- pkt:
+		default:
+		}
+	}
+
+	c.slots = remaining
+}
+
+// Close shuts down the client's TCP connection and dispatcher.
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -231,6 +385,11 @@ func (c *Client) Close() {
 	if c.tcpConn != nil && !c.isClosed {
 		c.tcpConn.Close()
 		c.isClosed = true
+	}
+
+	select {
+	case c.stopDispatch <- struct{}{}:
+	default:
 	}
 }
 

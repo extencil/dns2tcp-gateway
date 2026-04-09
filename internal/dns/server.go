@@ -275,8 +275,11 @@ func (s *Server) handleTXT(msg *dns.Msg, q dns.Question) {
 		return
 	}
 
-	// Encode response as TXT record.
-	txt := protocol.EncodeTXTResponse(resp, 0)
+	// Encode response as TXT record, split into 63-byte chunks.
+	// The dns2tcp C client expects DNS-label-style encoding (max 63 bytes
+	// per character-string). miekg/dns encodes each Txt slice entry as a
+	// separate character-string with a length prefix, matching this format.
+	chunks := protocol.EncodeTXTChunks(resp, 0)
 	msg.Answer = append(msg.Answer, &dns.TXT{
 		Hdr: dns.RR_Header{
 			Name:   q.Name,
@@ -284,7 +287,7 @@ func (s *Server) handleTXT(msg *dns.Msg, q dns.Question) {
 			Class:  dns.ClassINET,
 			Ttl:    0,
 		},
-		Txt: []string{txt},
+		Txt: chunks,
 	})
 }
 

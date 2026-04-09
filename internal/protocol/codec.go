@@ -127,3 +127,28 @@ func EncodeTXTResponse(p *Packet, answerIndex int) string {
 	encoded := encoding.EncodeToString(p.Marshal())
 	return string(indexChar) + encoded
 }
+
+// EncodeTXTChunks builds TXT record string chunks compatible with dns2tcp's
+// wire format. The original dns2tcp C server uses dns_encode() to split TXT
+// data into DNS label format (max 63 bytes per label). The C client's
+// dns_simple_decode() expects this format. miekg/dns encodes each string in
+// the Txt slice as a separate character-string with a length prefix, matching
+// the label format the client expects.
+func EncodeTXTChunks(p *Packet, answerIndex int) []string {
+	data := EncodeTXTResponse(p, answerIndex)
+
+	const maxLabel = 63
+	if len(data) <= maxLabel {
+		return []string{data}
+	}
+
+	var chunks []string
+	for len(data) > maxLabel {
+		chunks = append(chunks, data[:maxLabel])
+		data = data[maxLabel:]
+	}
+	if len(data) > 0 {
+		chunks = append(chunks, data)
+	}
+	return chunks
+}
