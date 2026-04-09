@@ -9,22 +9,26 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/ohmymex/dns2tcp-gateway/internal/config"
+	"github.com/ohmymex/dns2tcp-gateway/internal/protocol"
 	"github.com/ohmymex/dns2tcp-gateway/internal/session"
+	"github.com/ohmymex/dns2tcp-gateway/internal/tunnel"
 )
 
 // Server is an authoritative DNS server for the gateway zone.
 type Server struct {
-	udp    *dns.Server
-	tcp    *dns.Server
-	store  session.Store
-	cfg    config.Config
-	logger *slog.Logger
+	udp     *dns.Server
+	tcp     *dns.Server
+	store   session.Store
+	tunnel  *tunnel.Manager
+	cfg     config.Config
+	logger  *slog.Logger
 }
 
-// New creates a new DNS server wired to the given session store and config.
-func New(cfg config.Config, store session.Store, logger *slog.Logger) *Server {
+// New creates a new DNS server wired to the given session store, tunnel manager, and config.
+func New(cfg config.Config, store session.Store, tunnelMgr *tunnel.Manager, logger *slog.Logger) *Server {
 	s := &Server{
 		store:  store,
+		tunnel: tunnelMgr,
 		cfg:    cfg,
 		logger: logger.With("component", "dns"),
 	}
@@ -241,17 +245,58 @@ func (s *Server) handleA(msg *dns.Msg, q dns.Question) {
 
 func (s *Server) handleTXT(msg *dns.Msg, q dns.Question) {
 	zone := s.cfg.FQDN()
+
+	// Try to decode as dns2tcp protocol query.
+	parsed, err := protocol.DecodeQuery(q.Name, zone)
+	if err != nil {
+		s.logger.Debug("not a dns2tcp query, treating as plain", "name", q.Name, "error", err)
+		s.handlePlainTXT(msg, q)
+		return
+	}
+
+	if parsed.Packet == nil && parsed.Command == "" {
+		s.handlePlainTXT(msg, q)
+		return
+	}
+
+	// Route through tunnel manager.
+	resp, err := s.tunnel.HandleQuery(context.Background(), parsed)
+	if err != nil {
+		s.logger.Debug("tunnel query failed, falling back to plain", "error", err, "name", q.Name)
+		s.handlePlainTXT(msg, q)
+		return
+	}
+
+	// If the tunnel manager doesn't recognize the session and there's no
+	// active command, fall back to plain TXT handling. This prevents random
+	// subdomains from being treated as tunnel protocol queries.
+	if resp.Type == protocol.TypeErr && parsed.Command == "" {
+		s.handlePlainTXT(msg, q)
+		return
+	}
+
+	// Encode response as TXT record.
+	txt := protocol.EncodeTXTResponse(resp, 0)
+	msg.Answer = append(msg.Answer, &dns.TXT{
+		Hdr: dns.RR_Header{
+			Name:   q.Name,
+			Rrtype: dns.TypeTXT,
+			Class:  dns.ClassINET,
+			Ttl:    0,
+		},
+		Txt: []string{txt},
+	})
+}
+
+func (s *Server) handlePlainTXT(msg *dns.Msg, q dns.Question) {
+	zone := s.cfg.FQDN()
 	subdomain := extractSubdomain(q.Name, zone)
 
 	if subdomain == "" {
-		// Zone-level TXT, return empty.
 		msg.Ns = append(msg.Ns, s.soaRecord(zone))
 		return
 	}
 
-	// Look up the session for this subdomain.
-	// In Phase 3 this will handle actual dns2tcp protocol data.
-	// For now, return session info as TXT for debugging/validation.
 	sess, ok := s.store.Get(context.Background(), subdomain)
 	if !ok {
 		msg.SetRcode(msg, dns.RcodeNameError)

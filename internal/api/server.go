@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ohmymex/dns2tcp-gateway/internal/config"
+	"github.com/ohmymex/dns2tcp-gateway/internal/relay"
 	"github.com/ohmymex/dns2tcp-gateway/internal/session"
 )
 
@@ -15,14 +16,16 @@ import (
 type Server struct {
 	http   *http.Server
 	store  session.Store
+	relay  *relay.Manager
 	cfg    config.Config
 	logger *slog.Logger
 }
 
-// New creates a new API server wired to the given session store and config.
-func New(cfg config.Config, store session.Store, logger *slog.Logger) *Server {
+// New creates a new API server wired to the given session store, relay manager, and config.
+func New(cfg config.Config, store session.Store, relayMgr *relay.Manager, logger *slog.Logger) *Server {
 	s := &Server{
 		store:  store,
+		relay:  relayMgr,
 		cfg:    cfg,
 		logger: logger.With("component", "api"),
 	}

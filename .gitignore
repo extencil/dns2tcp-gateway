@@ -1,4 +1,5 @@
 # Binaries
+/dns2tcp
 /dns2tcp-gateway
 /gateway
 *.exe

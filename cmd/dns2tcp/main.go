@@ -10,9 +10,12 @@ import (
 	"time"
 
 	"github.com/ohmymex/dns2tcp-gateway/internal/api"
+	"github.com/ohmymex/dns2tcp-gateway/internal/banner"
 	"github.com/ohmymex/dns2tcp-gateway/internal/config"
 	"github.com/ohmymex/dns2tcp-gateway/internal/dns"
+	"github.com/ohmymex/dns2tcp-gateway/internal/relay"
 	"github.com/ohmymex/dns2tcp-gateway/internal/session"
+	"github.com/ohmymex/dns2tcp-gateway/internal/tunnel"
 )
 
 func main() {
@@ -35,15 +38,18 @@ func run() error {
 		return err
 	}
 
-	logger.Info("starting dns2tcp gateway",
-		"domain", cfg.Domain,
-		"dns_addr", cfg.DNSAddr,
-		"api_addr", cfg.APIAddr,
-		"gateway_ip", cfg.GatewayIP,
-	)
+	// Print startup banner to stderr (stdout is for structured logs).
+	banner.Print(os.Stderr, cfg.Domain, cfg.DNSAddr, cfg.APIAddr)
 
 	// Shared session store, injected into both DNS and API servers.
 	store := session.NewMemoryStore(logger)
+
+	// Tunnel manager handles dns2tcp protocol sessions.
+	tunnelKey := os.Getenv("GATEWAY_TUNNEL_KEY")
+	tunnelMgr := tunnel.NewManager(store, tunnelKey, logger)
+
+	// RTCP relay manager for reverse TCP sessions.
+	relayMgr := relay.NewManager(cfg.RTCPPortMin, cfg.RTCPPortMax, logger)
 
 	// Graceful shutdown context: cancelled on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -53,13 +59,13 @@ func run() error {
 	cleanupDone := store.StartCleanup(ctx, cfg.CleanupInterval)
 
 	// Start DNS server.
-	dnsServer := dns.New(cfg, store, logger)
+	dnsServer := dns.New(cfg, store, tunnelMgr, logger)
 	if err := dnsServer.Start(); err != nil {
 		return fmt.Errorf("starting dns server: %w", err)
 	}
 
 	// Start API server (non-blocking).
-	apiServer := api.New(cfg, store, logger)
+	apiServer := api.New(cfg, store, relayMgr, logger)
 	apiErrCh := make(chan error, 1)
 	go func() {
 		apiErrCh <- apiServer.Start()
@@ -87,6 +93,9 @@ func run() error {
 	if err := dnsServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("dns server shutdown error", "error", err)
 	}
+
+	tunnelMgr.Shutdown()
+	relayMgr.Shutdown()
 
 	// Wait for cleanup goroutine to finish.
 	<-cleanupDone

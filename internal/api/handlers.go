@@ -104,16 +104,26 @@ func (s *Server) handleCreateRTCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Allocate an RTCP port and start listening.
+	rtcpSess, err := s.relay.Create(r.Context(), sess.Subdomain)
+	if err != nil {
+		s.store.Delete(r.Context(), sess.Subdomain)
+		s.writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+
+	sess.RTCPPort = rtcpSess.Port
+
 	fqdn := fmt.Sprintf("%s.%s", sess.Subdomain, s.cfg.Domain)
 	s.writeJSON(w, http.StatusCreated, tunnelResponse{
 		ID:        sess.ID,
 		Subdomain: sess.Subdomain,
 		Domain:    fqdn,
 		Mode:      sess.Mode.String(),
-		RTCPPort:  sess.RTCPPort,
+		RTCPPort:  rtcpSess.Port,
 		CreatedAt: sess.CreatedAt.Format(time.RFC3339),
 		ExpiresAt: sess.ExpiresAt.Format(time.RFC3339),
-		Message:   fmt.Sprintf("use 'nc %s %d'. DNS tunnel to %s will terminate here.", s.cfg.GatewayIP, sess.RTCPPort, fqdn),
+		Message:   fmt.Sprintf("use 'nc %s %d'. DNS tunnel to %s will terminate here.", s.cfg.GatewayIP, rtcpSess.Port, fqdn),
 	})
 }
 

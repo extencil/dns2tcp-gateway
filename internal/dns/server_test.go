@@ -11,6 +11,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/ohmymex/dns2tcp-gateway/internal/config"
 	"github.com/ohmymex/dns2tcp-gateway/internal/session"
+	"github.com/ohmymex/dns2tcp-gateway/internal/tunnel"
 )
 
 func testConfig(addr string) config.Config {
@@ -41,7 +42,8 @@ func startTestServer(t *testing.T) (*Server, session.Store, string) {
 	store := session.NewMemoryStore(logger)
 	cfg := testConfig(addr)
 
-	srv := New(cfg, store, logger)
+	tunnelMgr := tunnel.NewManager(store, "", logger)
+	srv := New(cfg, store, tunnelMgr, logger)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("starting dns server: %v", err)
 	}
