@@ -28,6 +28,7 @@ const (
 type Client struct {
 	mu        sync.Mutex
 	SessionID uint16
+	Subdomain string
 	Challenge string
 	IsAuthed  bool
 	Resource  string

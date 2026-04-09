@@ -10,7 +10,7 @@ import (
 var encoding = base64.StdEncoding.WithPadding(base64.NoPadding)
 
 // Command prefixes used in dns2tcp protocol.
-// These appear as labels in the DNS query name: <data>.<command>.<domain>
+// These appear as labels in the DNS query name: <data>.=<command>.<subdomain>.<zone>
 const (
 	CmdAuth     = "auth"
 	CmdResource = "resource"
@@ -19,51 +19,77 @@ const (
 
 // ParsedQuery represents a decoded dns2tcp DNS query.
 type ParsedQuery struct {
-	Command string  // "auth", "resource", "connect", or "" for data queries
-	Packet  *Packet // decoded protocol packet
-	Raw     string  // raw query name for debugging
+	Command   string  // "auth", "resource", "connect", or "" for data queries
+	Subdomain string  // the session subdomain (e.g. "m6kfjz")
+	Packet    *Packet // decoded protocol packet
+	Raw       string  // raw query name for debugging
 }
 
 // DecodeQuery parses a dns2tcp DNS query name into its components.
-// Query format: <base64-labels>=<command>.<domain> or <base64-labels>.<domain>
 //
-// The "=" prefix on the command label is how dns2tcp marks control messages.
-// Data queries have no command prefix.
+// dns2tcpc is configured with domain = "<subdomain>.<zone>" (e.g. "m6kfjz.tun.numex.sh").
+// It sends queries in the format:
+//
+//	<base64-data>.=<command>.<subdomain>.<zone>
+//
+// For data queries (no command):
+//
+//	<base64-data>.<subdomain>.<zone>
+//
+// This function strips the zone, identifies the subdomain (last label),
+// finds the command (label with "=" prefix), and decodes the base64 data.
 func DecodeQuery(qname, zone string) (*ParsedQuery, error) {
-	qname = strings.ToLower(strings.TrimSuffix(qname, "."))
-	zone = strings.ToLower(strings.TrimSuffix(zone, "."))
+	// Trim trailing dot but preserve original case for base64 data.
+	qname = strings.TrimSuffix(qname, ".")
+	zone = strings.TrimSuffix(zone, ".")
 
-	if !strings.HasSuffix(qname, "."+zone) && qname != zone {
+	// Case-insensitive zone matching (DNS is case-insensitive for domain names).
+	qnameLower := strings.ToLower(qname)
+	zoneLower := strings.ToLower(zone)
+
+	if !strings.HasSuffix(qnameLower, "."+zoneLower) && qnameLower != zoneLower {
 		return nil, fmt.Errorf("protocol: query %q not in zone %q", qname, zone)
 	}
 
-	// Strip the zone to get the prefix.
-	prefix := strings.TrimSuffix(qname, "."+zone)
-	if prefix == "" || prefix == zone {
+	// Strip the zone from the ORIGINAL case query to preserve base64 data.
+	// Zone length is the same regardless of case.
+	prefix := qname[:len(qname)-len(zone)-1]
+	if prefix == "" {
 		return nil, fmt.Errorf("protocol: empty prefix in query %q", qname)
 	}
 
 	result := &ParsedQuery{Raw: qname}
 
-	// Split into labels and detect command.
+	// Split into labels.
 	labels := strings.Split(prefix, ".")
 	if len(labels) == 0 {
 		return nil, fmt.Errorf("protocol: no labels in query prefix %q", prefix)
 	}
 
-	// Check for command label (prefixed with "=" in dns2tcp).
-	// The command is the last label before the zone.
-	lastLabel := labels[len(labels)-1]
-	if strings.HasPrefix(lastLabel, "=") {
-		result.Command = strings.TrimPrefix(lastLabel, "=")
-		labels = labels[:len(labels)-1] // remove command label from data
+	// The last label is the session subdomain (case-insensitive, lowercase it).
+	result.Subdomain = strings.ToLower(labels[len(labels)-1])
+	labels = labels[:len(labels)-1]
+
+	// If only the subdomain was present (direct subdomain query, no data).
+	if len(labels) == 0 {
+		return result, nil
 	}
 
-	// Reassemble base64 data: strip dots between labels, they're just DNS label separators.
-	encoded := strings.Join(labels, "")
+	// Scan remaining labels for the command (prefixed with "=").
+	// Command is case-insensitive, data labels preserve original case for base64.
+	var dataLabels []string
+	for _, label := range labels {
+		if strings.HasPrefix(label, "=") || strings.HasPrefix(label, "=") {
+			result.Command = strings.ToLower(strings.TrimPrefix(label, "="))
+		} else {
+			dataLabels = append(dataLabels, label)
+		}
+	}
+
+	// Reassemble base64 data: join labels (dots are just DNS label separators).
+	encoded := strings.Join(dataLabels, "")
 
 	if encoded == "" {
-		// Command-only query with no data payload.
 		return result, nil
 	}
 
@@ -84,7 +110,6 @@ func DecodeQuery(qname, zone string) (*ParsedQuery, error) {
 }
 
 // EncodeResponse builds a base64-encoded response payload from a packet.
-// This is what goes into a DNS TXT or KEY record answer.
 func EncodeResponse(p *Packet) string {
 	return encoding.EncodeToString(p.Marshal())
 }

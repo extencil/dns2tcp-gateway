@@ -52,11 +52,11 @@ func (m *Manager) HandleQuery(ctx context.Context, q *protocol.ParsedQuery) (*pr
 
 	switch q.Command {
 	case protocol.CmdAuth:
-		return m.handleAuth(q.Packet)
+		return m.handleAuth(q.Packet, q.Subdomain)
 	case protocol.CmdResource:
-		return m.handleResource(ctx, q.Packet)
+		return m.handleResource(ctx, q.Packet, q.Subdomain)
 	case protocol.CmdConnect:
-		return m.handleConnect(ctx, q.Packet)
+		return m.handleConnect(ctx, q.Packet, q.Subdomain)
 	case "":
 		// Data or NOP query.
 		return m.handleData(q.Packet)
@@ -65,7 +65,7 @@ func (m *Manager) HandleQuery(ctx context.Context, q *protocol.ParsedQuery) (*pr
 	}
 }
 
-func (m *Manager) handleAuth(pkt *protocol.Packet) (*protocol.Packet, error) {
+func (m *Manager) handleAuth(pkt *protocol.Packet, subdomain string) (*protocol.Packet, error) {
 	if pkt.SessionID == 0 {
 		// Step 1: Client requests challenge. Create new session.
 		sessionID, err := m.generateSessionID()
@@ -80,12 +80,13 @@ func (m *Manager) handleAuth(pkt *protocol.Packet) (*protocol.Packet, error) {
 
 		client := NewClient(sessionID, m.logger)
 		client.Challenge = challenge
+		client.Subdomain = subdomain
 
 		m.mu.Lock()
 		m.clients[sessionID] = client
 		m.mu.Unlock()
 
-		m.logger.Info("auth challenge sent", "session_id", sessionID)
+		m.logger.Info("auth challenge sent", "session_id", sessionID, "subdomain", subdomain)
 
 		return &protocol.Packet{
 			SessionID: sessionID,
@@ -130,16 +131,15 @@ func (m *Manager) handleAuth(pkt *protocol.Packet) (*protocol.Packet, error) {
 	}, nil
 }
 
-func (m *Manager) handleResource(ctx context.Context, pkt *protocol.Packet) (*protocol.Packet, error) {
+func (m *Manager) handleResource(ctx context.Context, pkt *protocol.Packet, subdomain string) (*protocol.Packet, error) {
 	client := m.getClient(pkt.SessionID)
 	if client == nil || !client.IsAuthed {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
 
-	// Build resource list from active sessions that match this tunnel's needs.
-	// For each TCP session in the store, return it as an available resource.
-	// Format matches dns2tcp: "name:host:port"
-	resourceList := m.buildResourceList(ctx, pkt.SessionID)
+	// Build resource list. The subdomain identifies the REST API session
+	// which contains the target IP:PORT.
+	resourceList := m.buildResourceList(ctx, subdomain)
 
 	return &protocol.Packet{
 		SessionID: pkt.SessionID,
@@ -148,7 +148,7 @@ func (m *Manager) handleResource(ctx context.Context, pkt *protocol.Packet) (*pr
 	}, nil
 }
 
-func (m *Manager) handleConnect(ctx context.Context, pkt *protocol.Packet) (*protocol.Packet, error) {
+func (m *Manager) handleConnect(ctx context.Context, pkt *protocol.Packet, subdomain string) (*protocol.Packet, error) {
 	client := m.getClient(pkt.SessionID)
 	if client == nil || !client.IsAuthed {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
@@ -157,10 +157,11 @@ func (m *Manager) handleConnect(ctx context.Context, pkt *protocol.Packet) (*pro
 	resourceName := string(pkt.Payload)
 	client.Resource = resourceName
 
-	// Find the target for this resource by looking up sessions in the store.
-	target := m.resolveResource(ctx, resourceName)
+	// Resolve target using the subdomain from the DNS query.
+	// The subdomain maps to a REST API session that has the target IP:PORT.
+	target := m.resolveResource(ctx, subdomain)
 	if target == "" {
-		m.logger.Warn("resource not found", "resource", resourceName, "session_id", pkt.SessionID)
+		m.logger.Warn("resource not found", "resource", resourceName, "subdomain", subdomain, "session_id", pkt.SessionID)
 		return m.errPacket(pkt.SessionID, "resource not found"), nil
 	}
 
@@ -204,27 +205,30 @@ func (m *Manager) handleData(pkt *protocol.Packet) (*protocol.Packet, error) {
 	return client.DrainPending(pkt.Seq, MaxPayloadSize), nil
 }
 
-// resolveResource maps a dns2tcp resource name to a TCP target address.
-// It searches the session store for TCP-mode sessions whose subdomain
-// matches the resource name, or uses the resource name directly as a fallback.
-func (m *Manager) resolveResource(ctx context.Context, resourceName string) string {
-	// First, check if any session subdomain matches the resource name.
-	sess, ok := m.store.Get(ctx, resourceName)
-	if ok && sess.Mode == session.ModeTCP {
+// resolveResource looks up the REST API session by subdomain to find the TCP target.
+// The subdomain comes from the DNS query (e.g. "m6kfjz" from "data.=connect.m6kfjz.tun.numex.sh").
+func (m *Manager) resolveResource(ctx context.Context, subdomain string) string {
+	sess, ok := m.store.Get(ctx, subdomain)
+	if !ok {
+		return ""
+	}
+	if sess.Mode == session.ModeTCP {
 		return sess.Target()
 	}
-
-	// Walk all sessions to find one whose subdomain is used as the tunnel domain.
-	// This handles the case where the client connects to <subdomain>.<zone>
-	// and the resource name in the connect command references that session.
 	return ""
 }
 
-// buildResourceList returns a newline-separated list of available resources.
-func (m *Manager) buildResourceList(ctx context.Context, _ uint16) string {
-	// For now, return a static resource. In production this would
-	// enumerate TCP sessions available to this tunnel client.
-	return "tunnel:127.0.0.1:0"
+// buildResourceList returns the available resource for this subdomain's session.
+// Format matches dns2tcp: "name:host:port"
+func (m *Manager) buildResourceList(ctx context.Context, subdomain string) string {
+	sess, ok := m.store.Get(ctx, subdomain)
+	if !ok {
+		return ""
+	}
+	if sess.Mode == session.ModeTCP {
+		return fmt.Sprintf("tunnel:%s", sess.Target())
+	}
+	return ""
 }
 
 func (m *Manager) getClient(id uint16) *Client {
