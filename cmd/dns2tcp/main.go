@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -119,11 +120,43 @@ func loadConfig() config.Config {
 	if v := os.Getenv("GATEWAY_IP"); v != "" {
 		cfg.GatewayIP = v
 	}
+
+	// Explicit overrides (take precedence over domain-derived values).
+	if v := os.Getenv("GATEWAY_NAMESERVERS"); v != "" {
+		cfg.Nameservers = strings.Split(v, ",")
+	}
 	if v := os.Getenv("GATEWAY_ADMIN_CONTACT"); v != "" {
 		cfg.AdminContact = v
 	}
 
+	// TLS: gateway handles certificates via Let's Encrypt autocert.
+	if envBool("GATEWAY_TLS") {
+		cfg.TLSEnabled = true
+		cfg.APIAddr = ":443"
+		cfg.TLSHosts = []string{cfg.Domain}
+		if v := os.Getenv("GATEWAY_TLS_HOSTS"); v != "" {
+			cfg.TLSHosts = strings.Split(v, ",")
+		}
+		if v := os.Getenv("GATEWAY_TLS_CERT_DIR"); v != "" {
+			cfg.TLSCertDir = v
+		}
+	}
+
+	// Reverse proxy: gateway runs plain HTTP, TLS handled by nginx/caddy/etc.
+	if envBool("GATEWAY_REVERSE_PROXY") {
+		cfg.ReverseProxy = true
+		cfg.TLSEnabled = false // reverse proxy handles TLS
+	}
+
+	// Derive defaults from domain for fields not explicitly set.
+	cfg.ApplyDomainDefaults()
+
 	return cfg
+}
+
+func envBool(key string) bool {
+	v := os.Getenv(key)
+	return v == "true" || v == "1"
 }
 
 func logLevel() slog.Level {

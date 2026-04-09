@@ -46,6 +46,21 @@ type Config struct {
 
 	// AdminContact is the RNAME field in the SOA record (email in DNS format).
 	AdminContact string
+
+	// TLSEnabled enables automatic TLS via Let's Encrypt.
+	// When true, the gateway handles TLS itself (autocert on port 443).
+	TLSEnabled bool
+
+	// TLSHosts is the list of hostnames allowed for TLS certificates.
+	TLSHosts []string
+
+	// TLSCertDir is the directory for caching Let's Encrypt certificates.
+	TLSCertDir string
+
+	// ReverseProxy indicates the gateway sits behind a reverse proxy (nginx, caddy, etc).
+	// When true, the gateway runs plain HTTP and trusts X-Forwarded-For headers.
+	// TLS termination is the reverse proxy's responsibility.
+	ReverseProxy bool
 }
 
 // Default returns a Config populated with sensible production defaults.
@@ -54,7 +69,7 @@ func Default() Config {
 		Domain:          "thc.io",
 		DNSAddr:         ":53",
 		APIAddr:         ":8080",
-		Nameservers:     []string{"ns1.thc.io", "ns2.thc.io"},
+		Nameservers:     []string{}, // derived from Domain in main.go
 		GatewayIP:       "127.0.0.1",
 		SessionTTL:      1 * time.Hour,
 		CleanupInterval: 5 * time.Minute,
@@ -63,7 +78,24 @@ func Default() Config {
 		RateLimit:       30,
 		MaxTunnelsPerIP: 5,
 		DNSUDPSize:      4096,
-		AdminContact:    "admin.thc.io",
+		AdminContact:    "",    // derived from Domain in main.go
+		TLSEnabled:      false,
+		TLSCertDir:      "",
+		ReverseProxy:    false,
+	}
+}
+
+// ApplyDomainDefaults derives nameservers and admin contact from the domain
+// if they haven't been explicitly set.
+func (c *Config) ApplyDomainDefaults() {
+	if len(c.Nameservers) == 0 {
+		c.Nameservers = []string{"ns1." + c.Domain, "ns2." + c.Domain}
+	}
+	if c.AdminContact == "" {
+		c.AdminContact = "admin." + c.Domain
+	}
+	if c.TLSCertDir == "" {
+		c.TLSCertDir = "/var/lib/dns2tcp/certs"
 	}
 }
 

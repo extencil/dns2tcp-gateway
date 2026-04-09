@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/ohmymex/dns2tcp-gateway/internal/config"
 	"github.com/ohmymex/dns2tcp-gateway/internal/relay"
@@ -19,6 +22,7 @@ type Server struct {
 	relay  *relay.Manager
 	cfg    config.Config
 	logger *slog.Logger
+	tls    bool
 }
 
 // New creates a new API server wired to the given session store, relay manager, and config.
@@ -28,6 +32,7 @@ func New(cfg config.Config, store session.Store, relayMgr *relay.Manager, logger
 		relay:  relayMgr,
 		cfg:    cfg,
 		logger: logger.With("component", "api"),
+		tls:    cfg.TLSEnabled,
 	}
 
 	mux := http.NewServeMux()
@@ -41,14 +46,48 @@ func New(cfg config.Config, store session.Store, relayMgr *relay.Manager, logger
 		IdleTimeout:  60 * time.Second,
 	}
 
+	if s.tls {
+		manager := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.TLSHosts...),
+			Cache:      autocert.DirCache(cfg.TLSCertDir),
+		}
+
+		s.http.TLSConfig = &tls.Config{
+			GetCertificate: manager.GetCertificate,
+			MinVersion:     tls.VersionTLS12,
+		}
+
+		// HTTP-01 challenge listener on port 80.
+		go func() {
+			h := manager.HTTPHandler(nil)
+			srv := &http.Server{
+				Addr:         ":80",
+				Handler:      h,
+				ReadTimeout:  5 * time.Second,
+				WriteTimeout: 5 * time.Second,
+			}
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				s.logger.Error("acme http-01 challenge server failed", "error", err)
+			}
+		}()
+	}
+
 	return s
 }
 
-// Start begins serving HTTP requests. It blocks until the server stops.
+// Start begins serving HTTP(S) requests. It blocks until the server stops.
 func (s *Server) Start() error {
-	s.logger.Info("api server listening", "addr", s.cfg.APIAddr)
-	if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("api server: %w", err)
+	if s.tls {
+		s.logger.Info("api server listening (tls)", "addr", s.cfg.APIAddr)
+		if err := s.http.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("api server: %w", err)
+		}
+	} else {
+		s.logger.Info("api server listening", "addr", s.cfg.APIAddr)
+		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("api server: %w", err)
+		}
 	}
 	return nil
 }

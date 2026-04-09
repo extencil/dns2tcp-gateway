@@ -2,6 +2,7 @@
 /dns2tcp
 /dns2tcp-gateway
 /gateway
+/bin/
 *.exe
 *.exe~
 *.dll

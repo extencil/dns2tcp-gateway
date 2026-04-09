@@ -77,13 +77,50 @@ func (s *Session) Target() string {
 	return fmt.Sprintf("%s:%d", s.TargetIP, s.TargetPort)
 }
 
-// GenerateSubdomain creates a cryptographically random 6-character hex subdomain.
+// subdomainCharset is lowercase alphanumeric, excluding ambiguous chars (0, o, 1, l).
+const subdomainCharset = "abcdefghjkmnpqrstuvwxyz23456789"
+
+// GenerateSubdomain creates a cryptographically random 6-character alphanumeric subdomain.
+// Guarantees at least one letter and one digit for readability.
 func GenerateSubdomain() (string, error) {
-	b := make([]byte, 3)
+	const length = 6
+	for attempts := 0; attempts < 10; attempts++ {
+		b := make([]byte, length)
+		if _, err := rand.Read(b); err != nil {
+			return "", fmt.Errorf("session: generating subdomain: %w", err)
+		}
+
+		result := make([]byte, length)
+		hasLetter := false
+		hasDigit := false
+		for i := range result {
+			result[i] = subdomainCharset[b[i]%byte(len(subdomainCharset))]
+			if result[i] >= 'a' && result[i] <= 'z' {
+				hasLetter = true
+			}
+			if result[i] >= '2' && result[i] <= '9' {
+				hasDigit = true
+			}
+		}
+
+		if hasLetter && hasDigit {
+			return string(result), nil
+		}
+	}
+
+	// Fallback: force mix by placing a letter at pos 0 and digit at pos 1.
+	b := make([]byte, 6)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("session: generating subdomain: %w", err)
 	}
-	return hex.EncodeToString(b), nil
+	letters := "abcdefghjkmnpqrstuvwxyz"
+	digits := "23456789"
+	b[0] = letters[b[0]%byte(len(letters))]
+	b[1] = digits[b[1]%byte(len(digits))]
+	for i := 2; i < 6; i++ {
+		b[i] = subdomainCharset[b[i]%byte(len(subdomainCharset))]
+	}
+	return string(b), nil
 }
 
 // GenerateID creates a cryptographically random 16-character hex session ID.
