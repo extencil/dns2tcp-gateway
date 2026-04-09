@@ -25,23 +25,29 @@ const (
 	ReadBufferSize = 4096
 
 	// DrainWait is how long DrainPending holds a query slot waiting for TCP
-	// backend data before returning NOP. The original dns2tcp C server holds
-	// queries indefinitely (until data or eviction). We use 3s to cover
-	// the full SSH KEX handshake through DNS resolvers: version exchange +
-	// KEX INIT + ECDH + NEWKEYS + encrypted auth can take 1.5s+ total.
-	// Cloudflare retries at ~500ms create additional slots automatically.
-	DrainWait = 3000 * time.Millisecond
+	// backend data before returning NOP. Must be under Cloudflare's resolver
+	// timeout (~2s) to avoid SERVFAIL responses that cause dns2tcpc to reset.
+	// SSH encrypted responses arrive ~1200ms after the first query batch.
+	// 1500ms gives enough time for data while staying under SERVFAIL threshold.
+	DrainWait = 1500 * time.Millisecond
 
 	// dispatchInterval is how often the dispatcher checks for pending queries
 	// and data to match them up.
 	dispatchInterval = 10 * time.Millisecond
 )
 
+// slotMaxAge is the max age of a slot before it's considered stale.
+// Cloudflare gives up on queries after ~1-2s. Only dispatch data to
+// very fresh slots for reliable delivery. Old first-batch slots get
+// skipped; data waits for fresh NOP polling queries instead.
+const slotMaxAge = 500 * time.Millisecond
+
 // drainSlot represents a pending DNS query waiting for TCP backend data.
 type drainSlot struct {
-	seq      uint16
-	maxBytes int
-	result   chan *protocol.Packet
+	seq        uint16
+	maxBytes   int
+	result     chan *protocol.Packet
+	registeredAt time.Time
 }
 
 // Client represents an authenticated dns2tcp tunnel client.
@@ -83,6 +89,12 @@ type Client struct {
 	// Once true, nextIncomSeq must never go backwards -- prevents
 	// NOP/data retries from Cloudflare resetting the flush cursor.
 	flushing bool
+
+	// dispatchedSeqs tracks seqs that have already had DATA dispatched.
+	// Cloudflare retries create new slots for already-dispatched seqs.
+	// Without this guard, a retry slot gets filled with data from a
+	// DIFFERENT dispatch round, corrupting the server→client stream.
+	dispatchedSeqs map[uint16]bool
 
 	// Ordered dispatch: DNS handler goroutines register slots here.
 	// The dispatcher assigns data to slots sorted by seq (lowest first),
@@ -309,9 +321,10 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 
 	c.slotsMu.Lock()
 	c.slots = append(c.slots, drainSlot{
-		seq:      clientSeq,
-		maxBytes: maxBytes,
-		result:   result,
+		seq:          clientSeq,
+		maxBytes:     maxBytes,
+		result:       result,
+		registeredAt: time.Now(),
 	})
 	c.slotsMu.Unlock()
 
@@ -396,10 +409,17 @@ func (c *Client) dispatchPending() {
 		return
 	}
 
-	// Sort by seq so data goes to the lowest seq first.
+	// Sort by seq ascending to preserve data ordering. The client writes
+	// response data to TCP in arrival order, and ascending seq responses
+	// tend to arrive in order through DNS resolvers.
 	sort.Slice(c.slots, func(i, j int) bool {
 		return c.slots[i].seq < c.slots[j].seq
 	})
+
+	// Init dispatchedSeqs tracker.
+	if c.dispatchedSeqs == nil {
+		c.dispatchedSeqs = make(map[uint16]bool)
+	}
 
 	// Group slots by seq. Cloudflare retries create multiple slots with the
 	// same seq. We send the SAME data chunk to ALL slots with the same seq,
@@ -419,8 +439,43 @@ func (c *Client) dispatchPending() {
 		curGroup.slots = append(curGroup.slots, slot)
 	}
 
+	now := time.Now()
+
 	var remaining []drainSlot
 	for _, g := range groups {
+		// Guard: never dispatch DATA to a seq that was already dispatched.
+		if c.dispatchedSeqs[g.seq] {
+			for _, slot := range g.slots {
+				nop := &protocol.Packet{
+					SessionID: c.SessionID,
+					Seq:       slot.seq,
+					Type:      protocol.TypeACK | protocol.TypeNOP,
+				}
+				select {
+				case slot.result <- nop:
+				default:
+				}
+			}
+			continue
+		}
+
+		// Freshness check: only dispatch to groups that have at least one
+		// slot registered recently. Stale slots (from old Cloudflare queries)
+		// won't get responses through. Keep them waiting for a retry to
+		// create a fresh slot.
+		hasFresh := false
+		for _, slot := range g.slots {
+			if now.Sub(slot.registeredAt) < slotMaxAge {
+				hasFresh = true
+				break
+			}
+		}
+		if !hasFresh && len(c.pendingData) > 0 {
+			// All slots are stale. Keep waiting for fresh retry slots.
+			remaining = append(remaining, g.slots...)
+			continue
+		}
+
 		if len(c.pendingData) > 0 {
 			// Consume data ONCE for this seq.
 			n := len(c.pendingData)
@@ -433,6 +488,9 @@ func (c *Client) dispatchPending() {
 			c.pendingData = c.pendingData[n:]
 
 			c.logger.Debug("dispatch data", "seq", g.seq, "bytes", n, "remaining", len(c.pendingData))
+
+			// Mark this seq as dispatched (permanent for this session).
+			c.dispatchedSeqs[g.seq] = true
 
 			// Send the same chunk to ALL slots in this group.
 			for _, slot := range g.slots {
