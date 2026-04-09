@@ -24,9 +24,13 @@ const (
 	// ReadBufferSize is the TCP read buffer size.
 	ReadBufferSize = 4096
 
-	// DrainWait is how long DrainPending waits for its response from the
-	// dispatcher before returning NOP. Keep well under resolver retry timeout.
-	DrainWait = 300 * time.Millisecond
+	// DrainWait is how long DrainPending holds a query slot waiting for TCP
+	// backend data before returning NOP. The original dns2tcp C server holds
+	// queries indefinitely (until data or eviction). We use 3s to cover
+	// the full SSH KEX handshake through DNS resolvers: version exchange +
+	// KEX INIT + ECDH + NEWKEYS + encrypted auth can take 1.5s+ total.
+	// Cloudflare retries at ~500ms create additional slots automatically.
+	DrainWait = 3000 * time.Millisecond
 
 	// dispatchInterval is how often the dispatcher checks for pending queries
 	// and data to match them up.
@@ -69,6 +73,16 @@ type Client struct {
 	incomingBuf   map[uint16][]byte // seq -> data, waiting to be flushed
 	nextIncomSeq  uint16            // next seq to flush to TCP
 	incomSeqReady bool              // whether nextIncomSeq has been set
+
+	// seenSeqs tracks all query seqs (NOP + DATA) so flushIncoming can
+	// skip NOP gaps. Without this, nextIncomSeq gets stuck at NOP seq
+	// numbers that never appear in incomingBuf.
+	seenSeqs map[uint16]bool
+
+	// flushing is set true after the first data write to TCP.
+	// Once true, nextIncomSeq must never go backwards -- prevents
+	// NOP/data retries from Cloudflare resetting the flush cursor.
+	flushing bool
 
 	// Ordered dispatch: DNS handler goroutines register slots here.
 	// The dispatcher assigns data to slots sorted by seq (lowest first),
@@ -162,6 +176,36 @@ func (c *Client) signalDataReady() {
 	}
 }
 
+// MarkNOPSeen records that a NOP query (no payload) with this seq was received.
+// This allows flushIncoming to skip past NOP gaps in the seq space.
+// Only call this for queries that do NOT carry data. For data queries,
+// HandleData marks the seq internally.
+func (c *Client) MarkNOPSeen(seq uint16) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.seenSeqs == nil {
+		c.seenSeqs = make(map[uint16]bool)
+	}
+	c.seenSeqs[seq] = true
+
+	// Initialize nextIncomSeq on first query if not yet set.
+	if !c.incomSeqReady {
+		c.nextIncomSeq = seq
+		c.incomSeqReady = true
+	}
+	// Never go backwards once flushing has started -- Cloudflare retries
+	// would reset nextIncomSeq to old values, causing re-traversal.
+	if !c.flushing && seqBefore(seq, c.nextIncomSeq) {
+		c.nextIncomSeq = seq
+	}
+
+	// Try to flush -- a NOP seq might unblock buffered data.
+	if c.tcpConn != nil && !c.isClosed {
+		_ = c.flushIncoming()
+	}
+}
+
 // HandleData buffers incoming client data (received via DNS query) indexed by
 // seq, then flushes to the TCP backend in order. This handles out-of-order
 // query arrival through DNS resolvers, matching the original dns2tcp server's
@@ -185,11 +229,32 @@ func (c *Client) HandleData(seq uint16, data []byte) error {
 	if c.incomingBuf == nil {
 		c.incomingBuf = make(map[uint16][]byte)
 	}
+	if c.seenSeqs == nil {
+		c.seenSeqs = make(map[uint16]bool)
+	}
 
-	// Deduplicate: resolver retries send the same query (same seq) again.
-	if _, dup := c.incomingBuf[seq]; dup {
+	// Reject retries for seqs we've already flushed to TCP.
+	// This is the primary dedup: once nextIncomSeq passes a seq, it's done.
+	if c.flushing && c.incomSeqReady && seqBefore(seq, c.nextIncomSeq) {
+		c.logger.Debug("seq already flushed, rejecting", "seq", seq, "nextIncomSeq", c.nextIncomSeq)
+		return nil
+	}
+
+	// Secondary dedup via seenSeqs (catches retries for buffered-but-not-yet-flushed seqs).
+	if c.seenSeqs[seq] {
 		c.logger.Debug("duplicate incoming seq, skipping", "seq", seq)
 		return nil
+	}
+
+	// Mark as seen permanently (survives flush for retry dedup).
+	c.seenSeqs[seq] = true
+	if !c.incomSeqReady {
+		c.nextIncomSeq = seq
+		c.incomSeqReady = true
+	}
+	// Only go backwards during initial batch, never after flushing starts.
+	if !c.flushing && seqBefore(seq, c.nextIncomSeq) {
+		c.nextIncomSeq = seq
 	}
 
 	// Buffer this seq's data.
@@ -197,35 +262,32 @@ func (c *Client) HandleData(seq uint16, data []byte) error {
 	copy(buf, data)
 	c.incomingBuf[seq] = buf
 
-	// Set base seq on first data query.
-	if !c.incomSeqReady {
-		c.nextIncomSeq = seq
-		c.incomSeqReady = true
-	}
-	// Update base if we see a lower seq (earlier packet arrived late).
-	if seqBefore(seq, c.nextIncomSeq) {
-		c.nextIncomSeq = seq
-	}
-
 	// Flush consecutive data to TCP in order.
 	return c.flushIncoming()
 }
 
 // flushIncoming writes buffered client data to TCP in seq order.
+// Skips NOP gaps: if nextIncomSeq was seen (in seenSeqs) but has no data
+// (not in incomingBuf), it was a NOP query -- advance past it.
 // Must be called with c.mu held.
 func (c *Client) flushIncoming() error {
 	for {
-		data, ok := c.incomingBuf[c.nextIncomSeq]
-		if !ok {
+		if data, ok := c.incomingBuf[c.nextIncomSeq]; ok {
+			// Data query at this seq -- write to TCP.
+			c.flushing = true // lock direction: nextIncomSeq must never go backwards now
+			if _, err := c.tcpConn.Write(data); err != nil {
+				return fmt.Errorf("tunnel: writing to tcp: %w", err)
+			}
+			c.logger.Debug("forwarded to tcp", "bytes", len(data), "seq", c.nextIncomSeq)
+			delete(c.incomingBuf, c.nextIncomSeq)
+		} else if c.seenSeqs[c.nextIncomSeq] {
+			// NOP query at this seq -- no data, just skip.
+			c.logger.Debug("skipping NOP gap", "seq", c.nextIncomSeq)
+		} else {
+			// Haven't seen this seq yet -- stop.
 			return nil
 		}
 
-		if _, err := c.tcpConn.Write(data); err != nil {
-			return fmt.Errorf("tunnel: writing to tcp: %w", err)
-		}
-		c.logger.Debug("forwarded to tcp", "bytes", len(data), "seq", c.nextIncomSeq)
-
-		delete(c.incomingBuf, c.nextIncomSeq)
 		c.nextIncomSeq++
 		if c.nextIncomSeq == 0 {
 			c.nextIncomSeq = 1
@@ -307,9 +369,8 @@ func (c *Client) dispatcher() {
 			// Batch delay: wait for more queries to arrive through DNS
 			// resolvers before sorting and dispatching. dns2tcpc sends
 			// parallel queries that trickle in over ~5-20ms via Cloudflare.
-			// We need all queries in the batch registered before we can
-			// sort by seq and assign data to the correct slots.
-			time.Sleep(50 * time.Millisecond)
+			// Keep short to minimize latency; retries create additional slots.
+			time.Sleep(20 * time.Millisecond)
 		}
 
 		c.dispatchPending()
@@ -340,37 +401,69 @@ func (c *Client) dispatchPending() {
 		return c.slots[i].seq < c.slots[j].seq
 	})
 
-	var remaining []drainSlot
+	// Group slots by seq. Cloudflare retries create multiple slots with the
+	// same seq. We send the SAME data chunk to ALL slots with the same seq,
+	// so whichever DNS response Cloudflare forwards, the client gets correct
+	// data. pendingData is consumed once per unique seq, not per slot.
+	type seqGroup struct {
+		seq   uint16
+		slots []drainSlot
+	}
+	var groups []seqGroup
+	var curGroup *seqGroup
 	for _, slot := range c.slots {
-		pkt := &protocol.Packet{
-			SessionID: c.SessionID,
-			Seq:       slot.seq,
-			AckSeq:    0,
-			Type:      protocol.TypeACK,
+		if curGroup == nil || curGroup.seq != slot.seq {
+			groups = append(groups, seqGroup{seq: slot.seq})
+			curGroup = &groups[len(groups)-1]
 		}
+		curGroup.slots = append(curGroup.slots, slot)
+	}
 
+	var remaining []drainSlot
+	for _, g := range groups {
 		if len(c.pendingData) > 0 {
+			// Consume data ONCE for this seq.
 			n := len(c.pendingData)
-			if n > slot.maxBytes {
-				n = slot.maxBytes
+			maxBytes := g.slots[0].maxBytes
+			if n > maxBytes {
+				n = maxBytes
 			}
-			pkt.Payload = make([]byte, n)
-			copy(pkt.Payload, c.pendingData[:n])
+			chunk := make([]byte, n)
+			copy(chunk, c.pendingData[:n])
 			c.pendingData = c.pendingData[n:]
-			pkt.Type = protocol.TypeACK | protocol.TypeData
 
-			c.logger.Debug("dispatch data", "seq", slot.seq, "bytes", n, "remaining", len(c.pendingData))
+			c.logger.Debug("dispatch data", "seq", g.seq, "bytes", n, "remaining", len(c.pendingData))
+
+			// Send the same chunk to ALL slots in this group.
+			for _, slot := range g.slots {
+				pkt := &protocol.Packet{
+					SessionID: c.SessionID,
+					Seq:       slot.seq,
+					AckSeq:    0,
+					Type:      protocol.TypeACK | protocol.TypeData,
+					Payload:   chunk,
+				}
+				select {
+				case slot.result <- pkt:
+				default:
+				}
+			}
 		} else if closed {
-			pkt.Type = protocol.TypeDesauth
+			for _, slot := range g.slots {
+				pkt := &protocol.Packet{
+					SessionID: c.SessionID,
+					Seq:       slot.seq,
+					Type:      protocol.TypeDesauth,
+				}
+				select {
+				case slot.result <- pkt:
+				default:
+				}
+			}
 		} else {
-			// No more data for remaining slots; keep them waiting.
-			remaining = append(remaining, slot)
+			// No more data; keep all slots in this group waiting.
+			remaining = append(remaining, g.slots...)
 			continue
-		}
-
-		select {
-		case slot.result <- pkt:
-		default:
 		}
 	}
 

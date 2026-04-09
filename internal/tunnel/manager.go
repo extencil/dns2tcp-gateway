@@ -195,10 +195,14 @@ func (m *Manager) handleData(pkt *protocol.Packet) (*protocol.Packet, error) {
 	}
 
 	// If the packet carries data, forward it to the TCP backend.
+	// HandleData marks the seq as seen internally.
+	// For NOP queries, mark seen separately so flushIncoming can skip NOP gaps.
 	if pkt.IsData() && len(pkt.Payload) > 0 {
 		if err := client.HandleData(pkt.Seq, pkt.Payload); err != nil {
 			m.logger.Debug("data forward failed", "error", err, "session_id", pkt.SessionID)
 		}
+	} else {
+		client.MarkNOPSeen(pkt.Seq)
 	}
 
 	// Drain pending TCP data into the DNS response.
