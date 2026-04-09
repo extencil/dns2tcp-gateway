@@ -51,6 +51,11 @@ func DecodeQuery(qname, zone string) (*ParsedQuery, error) {
 		return nil, fmt.Errorf("protocol: query %q not in zone %q", qname, zone)
 	}
 
+	// Zone apex query (e.g. "tun.numex.sh" with no subdomain prefix).
+	if qnameLower == zoneLower {
+		return nil, fmt.Errorf("protocol: zone apex query %q, no tunnel data", qname)
+	}
+
 	// Strip the zone from the ORIGINAL case query to preserve base64 data.
 	// Zone length is the same regardless of case.
 	prefix := qname[:len(qname)-len(zone)-1]

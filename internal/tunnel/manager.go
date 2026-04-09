@@ -196,7 +196,7 @@ func (m *Manager) handleData(pkt *protocol.Packet) (*protocol.Packet, error) {
 
 	// If the packet carries data, forward it to the TCP backend.
 	if pkt.IsData() && len(pkt.Payload) > 0 {
-		if err := client.HandleData(pkt.Payload); err != nil {
+		if err := client.HandleData(pkt.Seq, pkt.Payload); err != nil {
 			m.logger.Debug("data forward failed", "error", err, "session_id", pkt.SessionID)
 		}
 	}
