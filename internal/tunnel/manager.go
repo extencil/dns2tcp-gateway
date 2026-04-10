@@ -24,25 +24,35 @@ func (r Resource) Addr() string {
 	return fmt.Sprintf("%s:%d", r.Host, r.Port)
 }
 
+const (
+	maxClients       = 1000            // max concurrent tunnel clients
+	authTimeout      = 30 * time.Second // unauthenticated clients get reaped after this
+	clientCleanupInt = 10 * time.Second
+)
+
 // Manager handles dns2tcp tunnel protocol sessions.
-// It is the bridge between the DNS server and TCP backends.
 type Manager struct {
 	mu      sync.RWMutex
-	clients map[uint16]*Client // keyed by session ID
+	clients map[uint16]*Client
 
-	store  session.Store
-	logger *slog.Logger
-	key    string // shared authentication key, empty = no auth
+	store    session.Store
+	logger   *slog.Logger
+	key      string
+	stopOnce sync.Once
+	stop     chan struct{}
 }
 
 // NewManager creates a new tunnel manager.
 func NewManager(store session.Store, key string, logger *slog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		clients: make(map[uint16]*Client),
 		store:   store,
 		key:     key,
 		logger:  logger.With("component", "tunnel"),
+		stop:    make(chan struct{}),
 	}
+	go m.cleanupLoop()
+	return m
 }
 
 // HandleQuery processes an incoming dns2tcp protocol query and returns a response packet.
@@ -68,7 +78,18 @@ func (m *Manager) HandleQuery(ctx context.Context, q *protocol.ParsedQuery) (*pr
 
 func (m *Manager) handleAuth(pkt *protocol.Packet, subdomain string) (*protocol.Packet, error) {
 	if pkt.SessionID == 0 {
-		// Step 1: Client requests challenge. Create new session.
+		/* step 1: client requests challenge */
+		m.mu.RLock()
+		count := len(m.clients)
+		m.mu.RUnlock()
+		if count >= maxClients {
+			return &protocol.Packet{
+				SessionID: 0,
+				Type:      protocol.TypeErr,
+				Payload:   []byte("server full"),
+			}, nil
+		}
+
 		sessionID, err := m.generateSessionID()
 		if err != nil {
 			return nil, err
@@ -278,8 +299,41 @@ func (m *Manager) generateSessionID() (uint16, error) {
 	return 0, fmt.Errorf("tunnel: failed to generate unique session id after 100 attempts")
 }
 
-// Shutdown closes all active tunnel clients.
+/*
+ * cleanupLoop: reap unauthenticated clients that didn't complete auth
+ * within authTimeout. Prevents memory exhaustion from DNS auth spam.
+ */
+func (m *Manager) cleanupLoop() {
+	ticker := time.NewTicker(clientCleanupInt)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.reapStaleClients()
+		case <-m.stop:
+			return
+		}
+	}
+}
+
+func (m *Manager) reapStaleClients() {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for id, client := range m.clients {
+		if !client.IsAuthed && now.Sub(client.CreatedAt) > authTimeout {
+			client.Close()
+			delete(m.clients, id)
+			m.logger.Debug("reaped stale client", "session_id", id)
+		}
+	}
+}
+
 func (m *Manager) Shutdown() {
+	m.stopOnce.Do(func() { close(m.stop) })
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

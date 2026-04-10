@@ -78,6 +78,7 @@ type Client struct {
 	IsAuthed  bool
 	authedCh  chan struct{} // closed when IsAuthed becomes true
 	Resource  string
+	CreatedAt time.Time
 
 	tcpConn     net.Conn
 	pendingData []byte
@@ -108,6 +109,7 @@ type Client struct {
 func NewClient(sessionID uint16, logger *slog.Logger) *Client {
 	return &Client{
 		SessionID:  sessionID,
+		CreatedAt:  time.Now(),
 		authedCh:   make(chan struct{}),
 		ring:       make(map[uint16]*seqSlot),
 		dispatched: make(map[uint16]*protocol.Packet),
