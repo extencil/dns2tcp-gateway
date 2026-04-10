@@ -7,7 +7,7 @@
 * Cap tunnel clients at 1000, reject new auth when full
 * Reap unauthenticated clients after 30 seconds (prevents memory exhaustion from DNS auth spam)
 * Require Bearer token for DELETE endpoint (prevents unauthorized tunnel deletion)
-* Block private/reserved IP ranges on TCP and NS endpoints (SSRF fix)
+* Block private/reserved IP ranges on TCP and NS endpoints (SSRF fix, reported by [@extencil](https://github.com/extencil))
 * Only trust X-Forwarded-For when GATEWAY_REVERSE_PROXY=true (XFF spoofing fix)
 * Consistent IP extraction for rate limiter and tunnel ownership
 
