@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ohmymex/dns2tcp-gateway/internal/protocol"
 	"github.com/ohmymex/dns2tcp-gateway/internal/session"
@@ -122,7 +123,7 @@ func (m *Manager) handleAuth(pkt *protocol.Packet, subdomain string) (*protocol.
 		}
 	}
 
-	client.IsAuthed = true
+	client.SetAuthed()
 	m.logger.Info("auth success", "session_id", pkt.SessionID)
 
 	return &protocol.Packet{
@@ -133,7 +134,12 @@ func (m *Manager) handleAuth(pkt *protocol.Packet, subdomain string) (*protocol.
 
 func (m *Manager) handleResource(ctx context.Context, pkt *protocol.Packet, subdomain string) (*protocol.Packet, error) {
 	client := m.getClient(pkt.SessionID)
-	if client == nil || !client.IsAuthed {
+	if client == nil {
+		return m.errPacket(pkt.SessionID, "not authenticated"), nil
+	}
+	// Through public resolvers, =resource can arrive before auth step 2.
+	// Wait briefly for auth to complete.
+	if !client.WaitAuthed(500 * time.Millisecond) {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
 
@@ -150,7 +156,13 @@ func (m *Manager) handleResource(ctx context.Context, pkt *protocol.Packet, subd
 
 func (m *Manager) handleConnect(ctx context.Context, pkt *protocol.Packet, subdomain string) (*protocol.Packet, error) {
 	client := m.getClient(pkt.SessionID)
-	if client == nil || !client.IsAuthed {
+	if client == nil {
+		return m.errPacket(pkt.SessionID, "not authenticated"), nil
+	}
+	// Through public resolvers like Cloudflare, =connect can arrive before
+	// the auth step 2 HMAC response. The client sends them ~200ms apart but
+	// Cloudflare can reorder. Wait briefly for auth to complete.
+	if !client.WaitAuthed(500 * time.Millisecond) {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
 

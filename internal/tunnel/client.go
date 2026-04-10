@@ -92,6 +92,7 @@ type Client struct {
 	Subdomain string
 	Challenge string
 	IsAuthed  bool
+	authedCh  chan struct{} // closed when IsAuthed becomes true
 	Resource  string
 
 	// TCP connection to the backend resource.
@@ -137,6 +138,7 @@ type Client struct {
 func NewClient(sessionID uint16, logger *slog.Logger) *Client {
 	return &Client{
 		SessionID:  sessionID,
+		authedCh:   make(chan struct{}),
 		ring:       make(map[uint16]*seqSlot),
 		dispatched: make(map[uint16]*protocol.Packet),
 		stopSweep:  make(chan struct{}),
@@ -639,6 +641,35 @@ func (c *Client) Close() {
 	select {
 	case c.stopSweep <- struct{}{}:
 	default:
+	}
+}
+
+// SetAuthed marks the client as authenticated and unblocks any goroutines
+// waiting in WaitAuthed. Through public resolvers like Cloudflare, the
+// =connect query can arrive before the auth step 2 HMAC response. This
+// signaling mechanism lets handleConnect wait for auth to complete.
+func (c *Client) SetAuthed() {
+	c.mu.Lock()
+	c.IsAuthed = true
+	c.mu.Unlock()
+	close(c.authedCh)
+}
+
+// WaitAuthed blocks until the client is authenticated or the timeout expires.
+// Returns true if authenticated, false if timed out.
+func (c *Client) WaitAuthed(timeout time.Duration) bool {
+	c.mu.Lock()
+	if c.IsAuthed {
+		c.mu.Unlock()
+		return true
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-c.authedCh:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 
