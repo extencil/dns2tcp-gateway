@@ -29,12 +29,39 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+var privateRanges []*net.IPNet
+
+func init() {
+	for _, cidr := range []string{
+		"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+		"169.254.0.0/16", "0.0.0.0/8", "100.64.0.0/10",
+		"::1/128", "fc00::/7", "fe80::/10", "::/128",
+	} {
+		_, block, _ := net.ParseCIDR(cidr)
+		privateRanges = append(privateRanges, block)
+	}
+}
+
+func isPrivateIP(ip net.IP) bool {
+	for _, block := range privateRanges {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleCreateTCP(w http.ResponseWriter, r *http.Request) {
 	ip := r.PathValue("ip")
 	portStr := r.PathValue("port")
 
-	if net.ParseIP(ip) == nil {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
 		s.writeError(w, http.StatusBadRequest, "invalid ip address")
+		return
+	}
+	if isPrivateIP(parsed) {
+		s.writeError(w, http.StatusForbidden, "private/reserved ip addresses are not allowed")
 		return
 	}
 
@@ -67,8 +94,13 @@ func (s *Server) handleCreateNS(w http.ResponseWriter, r *http.Request) {
 	ip := r.PathValue("ip")
 	portStr := r.PathValue("port")
 
-	if net.ParseIP(ip) == nil {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
 		s.writeError(w, http.StatusBadRequest, "invalid ip address")
+		return
+	}
+	if isPrivateIP(parsed) {
+		s.writeError(w, http.StatusForbidden, "private/reserved ip addresses are not allowed")
 		return
 	}
 
