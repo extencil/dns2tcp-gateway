@@ -203,7 +203,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) createSession(r *http.Request, mode session.Mode, ip string, port int) (*session.Session, error) {
 	// Check per-IP tunnel limit.
-	ownerIP := extractClientIP(r)
+	ownerIP := extractClientIP(r, s.cfg.ReverseProxy)
 	existing := s.store.ListByOwner(r.Context(), ownerIP)
 	if len(existing) >= s.cfg.MaxTunnelsPerIP {
 		return nil, fmt.Errorf("max tunnels per ip reached (%d)", s.cfg.MaxTunnelsPerIP)
@@ -250,16 +250,17 @@ func (s *Server) writeError(w http.ResponseWriter, status int, msg string) {
 	s.writeJSON(w, status, errorResponse{Error: msg})
 }
 
-// extractClientIP gets the client IP from X-Forwarded-For or RemoteAddr.
-func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain (client IP).
-		for i := 0; i < len(xff); i++ {
-			if xff[i] == ',' {
-				return xff[:i]
+/* extractClientIP: only trust XFF when behind a reverse proxy */
+func extractClientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			for i := 0; i < len(xff); i++ {
+				if xff[i] == ',' {
+					return xff[:i]
+				}
 			}
+			return xff
 		}
-		return xff
 	}
 
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

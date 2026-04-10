@@ -47,6 +47,9 @@ func run() error {
 
 	// Tunnel manager handles dns2tcp protocol sessions.
 	tunnelKey := os.Getenv("GATEWAY_TUNNEL_KEY")
+	if tunnelKey == "" {
+		logger.Warn("GATEWAY_TUNNEL_KEY not set, dns2tcp auth is open to any client")
+	}
 	tunnelMgr := tunnel.NewManager(store, tunnelKey, logger)
 
 	// RTCP relay manager for reverse TCP sessions.

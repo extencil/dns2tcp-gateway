@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -191,10 +190,7 @@ var limiter = newIPLimiter()
 
 func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if ip == "" {
-			ip = r.RemoteAddr
-		}
+		ip := extractClientIP(r, s.cfg.ReverseProxy)
 
 		if !limiter.get(ip).Allow() {
 			s.logger.Warn("rate limited", "remote", ip)
