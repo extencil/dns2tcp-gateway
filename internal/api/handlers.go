@@ -16,6 +16,7 @@ type tunnelResponse struct {
 	ID        string `json:"id"`
 	Subdomain string `json:"subdomain"`
 	Domain    string `json:"domain"`
+	Token     string `json:"token,omitempty"`
 	Mode      string `json:"mode"`
 	Target    string `json:"target,omitempty"`
 	RTCPPort  int    `json:"rtcp_port,omitempty"`
@@ -82,6 +83,7 @@ func (s *Server) handleCreateTCP(w http.ResponseWriter, r *http.Request) {
 		ID:        sess.ID,
 		Subdomain: sess.Subdomain,
 		Domain:    fqdn,
+		Token:     sess.Token,
 		Mode:      sess.Mode.String(),
 		Target:    sess.Target(),
 		CreatedAt: sess.CreatedAt.Format(time.RFC3339),
@@ -121,6 +123,7 @@ func (s *Server) handleCreateNS(w http.ResponseWriter, r *http.Request) {
 		ID:        sess.ID,
 		Subdomain: sess.Subdomain,
 		Domain:    fqdn,
+		Token:     sess.Token,
 		Mode:      sess.Mode.String(),
 		Target:    sess.Target(),
 		CreatedAt: sess.CreatedAt.Format(time.RFC3339),
@@ -151,6 +154,7 @@ func (s *Server) handleCreateRTCP(w http.ResponseWriter, r *http.Request) {
 		ID:        sess.ID,
 		Subdomain: sess.Subdomain,
 		Domain:    fqdn,
+		Token:     sess.Token,
 		Mode:      sess.Mode.String(),
 		RTCPPort:  rtcpSess.Port,
 		CreatedAt: sess.CreatedAt.Format(time.RFC3339),
@@ -184,11 +188,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	subdomain := r.PathValue("subdomain")
 
-	if !s.store.Delete(r.Context(), subdomain) {
-		s.writeError(w, http.StatusNotFound, "tunnel not found")
+	/* extract token from Authorization: Bearer <token> */
+	token := ""
+	if auth := r.Header.Get("Authorization"); len(auth) > 7 && auth[:7] == "Bearer " {
+		token = auth[7:]
+	}
+	if token == "" {
+		s.writeError(w, http.StatusUnauthorized, "missing Authorization: Bearer <token>")
 		return
 	}
 
+	sess, ok := s.store.Get(r.Context(), subdomain)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, "tunnel not found")
+		return
+	}
+	if sess.Token != token {
+		s.writeError(w, http.StatusForbidden, "invalid token")
+		return
+	}
+
+	s.store.Delete(r.Context(), subdomain)
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"message": fmt.Sprintf("tunnel %s deleted", subdomain),
 	})
@@ -219,10 +239,16 @@ func (s *Server) createSession(r *http.Request, mode session.Mode, ip string, po
 		return nil, fmt.Errorf("generating subdomain: %w", err)
 	}
 
+	token, err := session.GenerateToken()
+	if err != nil {
+		return nil, fmt.Errorf("generating token: %w", err)
+	}
+
 	now := time.Now()
 	sess := &session.Session{
 		ID:         id,
 		Subdomain:  subdomain,
+		Token:      token,
 		Mode:       mode,
 		TargetIP:   ip,
 		TargetPort: port,

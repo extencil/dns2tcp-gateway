@@ -47,16 +47,17 @@ func ParseMode(s string) (Mode, error) {
 
 // Session represents an active tunnel session.
 type Session struct {
-	ID        string    `json:"id"`
-	Subdomain string    `json:"subdomain"`
-	Mode      Mode      `json:"mode"`
-	TargetIP  string    `json:"target_ip,omitempty"`
-	TargetPort int      `json:"target_port,omitempty"`
-	RTCPPort  int       `json:"rtcp_port,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	OwnerIP   string    `json:"owner_ip"`
-	isActive  bool
+	ID         string    `json:"id"`
+	Subdomain  string    `json:"subdomain"`
+	Token      string    `json:"token"`
+	Mode       Mode      `json:"mode"`
+	TargetIP   string    `json:"target_ip,omitempty"`
+	TargetPort int       `json:"target_port,omitempty"`
+	RTCPPort   int       `json:"rtcp_port,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	OwnerIP    string    `json:"owner_ip"`
+	isActive   bool
 }
 
 // IsExpired returns true if the session has passed its expiry time.
@@ -128,6 +129,15 @@ func GenerateID() (string, error) {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("session: generating id: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// GenerateToken creates a cryptographically random 32-character hex token.
+func GenerateToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("session: generating token: %w", err)
 	}
 	return hex.EncodeToString(b), nil
 }

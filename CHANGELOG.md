@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.3
+
+### Security
+
+* Require Bearer token for DELETE endpoint (prevents unauthorized tunnel deletion)
+* Block private/reserved IP ranges on TCP and NS endpoints (SSRF fix)
+* Only trust X-Forwarded-For when GATEWAY_REVERSE_PROXY=true (XFF spoofing fix)
+* Consistent IP extraction for rate limiter and tunnel ownership
+
+### Changes
+
+* Tunnel creation now returns a `token` field, required for deletion
+* RTCP message shows domain instead of raw IP
+* Warn at startup if GATEWAY_TUNNEL_KEY is not set
+* Add dist/ to gitignore
+
 ## v0.1.0
 
 Initial release.

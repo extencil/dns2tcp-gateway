@@ -132,11 +132,14 @@ curl -X POST https://tun.domain.com/v1/tcp/10.0.0.5/4444
 {
   "subdomain": "a3f2bc",
   "domain": "a3f2bc.tun.domain.com",
+  "token": "c2334e6cfda45870a132286ac5d298e4",
   "mode": "tcp",
   "target": "10.0.0.5:4444",
   "message": "DNS tunnel to a3f2bc.tun.domain.com will forward to 10.0.0.5:4444"
 }
 ```
+
+Save the `token` value. You need it to delete the tunnel.
 
 ### Create NS delegation
 
@@ -172,6 +175,13 @@ GET /v1/status/{subdomain}
 
 ```
 DELETE /v1/{subdomain}
+Authorization: Bearer <token>
+```
+
+Requires the token returned during tunnel creation.
+
+```bash
+curl -X DELETE https://tun.domain.com/v1/a3f2bc -H "Authorization: Bearer c2334e6cfda45870a132286ac5d298e4"
 ```
 
 ### Health check
