@@ -1,9 +1,11 @@
 # Changelog
 
-## v0.1.3
+## v0.1.4
 
 ### Security
 
+* Cap tunnel clients at 1000, reject new auth when full
+* Reap unauthenticated clients after 30 seconds (prevents memory exhaustion from DNS auth spam)
 * Require Bearer token for DELETE endpoint (prevents unauthorized tunnel deletion)
 * Block private/reserved IP ranges on TCP and NS endpoints (SSRF fix)
 * Only trust X-Forwarded-For when GATEWAY_REVERSE_PROXY=true (XFF spoofing fix)
@@ -14,7 +16,6 @@
 * Tunnel creation now returns a `token` field, required for deletion
 * RTCP message shows domain instead of raw IP
 * Warn at startup if GATEWAY_TUNNEL_KEY is not set
-* Add dist/ to gitignore
 
 ## v0.1.0
 
