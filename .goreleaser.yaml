@@ -20,16 +20,12 @@ builds:
 
 archives:
   - id: dns2tcp-gateway
-    builds:
-      - dns2tcp-gateway
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format: tar.gz
 
 checksum:
   name_template: checksums.txt
 
 changelog:
-  use: github
   sort: asc
 
 release:

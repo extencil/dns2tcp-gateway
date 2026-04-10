@@ -1,46 +1,62 @@
 # DNS2TCP Gateway
 
-DNS tunnel gateway as a service. Eliminates DNS tunnel setup complexity by providing managed DNS infrastructure. Users curl a REST API to get a random subdomain, then use that subdomain with `dns2tcpc` to tunnel TCP over DNS.
+DNS tunnel gateway as a service. Eliminates the pain of setting up domain servers, domain names, and public IPs for DNS tunneling. Users curl a REST API to get a randomly generated subdomain, then use that subdomain with dns2tcpc, iodine, or sshimpanzee.
 
 Based on [THC hackerschoice/ToolsWeNeed](https://github.com/orgs/hackerschoice/projects/4/views/1?pane=issue&itemId=54763597) by SkyperTHC.
 
-## How it works
+## What it solves
 
 ```
-You                          Gateway (this)                    Target
- |                               |                               |
- |  curl /v1/tcp/1.2.3.4/22     |                               |
- |------------------------------>| creates subdomain xyz123       |
- |  { "subdomain": "xyz123" }   |                               |
- |<------------------------------|                               |
- |                               |                               |
- |  dns2tcpc -z xyz123.gw.tld   |                               |
- |  -l 2222 <resolver>          |                               |
- |..........DNS queries.........>| decodes, forwards TCP ------->|
- |<.........DNS responses........| <-------- TCP data -----------|
- |                               |                               |
- |  ssh -p 2222 user@127.0.0.1  |                               |
- |  (tunneled through DNS)       |                               |
+TARGET                                                              RECEIVER
+  |                                                                    |
+  +-- TCP traffic                                                      |
+  v                                                                    |
+dns2tcpc --DNS queries--> [Global DNS] --> [xxx.domain.com] --> dns2tcp ---+
+                                           XXXXXXXXXXXXX               v
+                                           this gateway            TCP output
 ```
 
-The gateway runs an authoritative DNS server and a REST API. When a tunnel is created, the gateway assigns a random subdomain and handles the dns2tcp protocol, forwarding TCP traffic to the specified target.
+The part marked with `XXX` is the pain point for most users: you need a domain, NS delegation, a public server, and a running dns2tcpd. This gateway handles all of that. Just curl and go.
+
+## Three modes
+
+**TCP forward:** tunnel to any IP:PORT through DNS
+
+```bash
+curl https://domain.com/v1/tcp/1.2.3.4/31337
+# -> "DNS tunnel to adsgr.domain.com will forward to 1.2.3.4:31337"
+```
+
+**NS delegation:** point a subdomain's NS to your own server (for iodine, custom dns2tcpd, etc)
+
+```bash
+curl https://domain.com/v1/ns/1.2.3.4/53
+# -> "adsgr.domain.com NS will point to 1.2.3.4:53"
+```
+
+**Reverse TCP (RTCP):** connect TO the gateway and wait for the DNS tunnel to activate
+
+```bash
+curl https://domain.com/v1/rtcp
+# -> "use 'nc domain.com 31337'. DNS tunnel to adsgr.domain.com will terminate here."
+```
 
 ## Public service
 
-A public instance is running at **tun.numex.sh**. You can try it without setting up your own server:
+A public instance is running at **tun.numex.sh**. Try it without setting up anything:
 
 ```bash
 # Create a tunnel to any TCP target
-SUB=$(curl -s -X POST https://tun.numex.sh/v1/tcp/TARGET_IP/22 | jq -r .subdomain)
+SUB=$(curl -s -X POST https://tun.numex.sh/v1/tcp/<ip>/<port> | jq -r .subdomain)
 
-# Connect using Cloudflare resolver
+# Start dns2tcp client (pick any supported resolver)
 dns2tcpc -r tunnel -z $SUB.tun.numex.sh -l 2222 1.1.1.1
 
-# SSH through the tunnel
+# Connect through the tunnel (example: SSH)
 ssh -p 2222 user@127.0.0.1
 ```
 
-You can use any of the supported resolvers listed below, or point directly at the gateway IP for best performance.
+Replace `<ip>` and `<port>` with your target. Works with any TCP service, not just SSH.
 
 ## Supported DNS resolvers
 
@@ -89,13 +105,13 @@ Port 53 requires root or `setcap cap_net_bind_service=+ep ./dns2tcp-gateway`.
 
 ```bash
 # Create tunnel (from any machine)
-SUB=$(curl -s -X POST https://tun.domain.com/v1/tcp/TARGET_IP/22 | jq -r .subdomain)
+SUB=$(curl -s -X POST https://tun.domain.com/v1/tcp/<ip>/<port> | jq -r .subdomain)
 
 # Start dns2tcp client (pick any supported resolver)
-dns2tcpc -r tunnel -z $SUB.tun.domain.com -l 2222 1.1.1.1
+dns2tcpc -r tunnel -z $SUB.tun.domain.com -l <local_port> 1.1.1.1
 
 # Connect through the tunnel
-ssh -p 2222 user@127.0.0.1
+nc 127.0.0.1 <local_port>
 ```
 
 ## API
@@ -109,7 +125,7 @@ POST /v1/tcp/{ip}/{port}
 Creates a tunnel that forwards to `ip:port`. Returns a subdomain to use with dns2tcpc.
 
 ```bash
-curl -X POST https://tun.domain.com/v1/tcp/10.0.0.5/22
+curl -X POST https://tun.domain.com/v1/tcp/10.0.0.5/4444
 ```
 
 ```json
@@ -117,8 +133,8 @@ curl -X POST https://tun.domain.com/v1/tcp/10.0.0.5/22
   "subdomain": "a3f2bc",
   "domain": "a3f2bc.tun.domain.com",
   "mode": "tcp",
-  "target": "10.0.0.5:22",
-  "message": "DNS tunnel to a3f2bc.tun.domain.com will forward to 10.0.0.5:22"
+  "target": "10.0.0.5:4444",
+  "message": "DNS tunnel to a3f2bc.tun.domain.com will forward to 10.0.0.5:4444"
 }
 ```
 
@@ -132,6 +148,18 @@ Delegates NS for the subdomain to `ip:port`. Use this if you run your own DNS tu
 
 ```bash
 curl -X POST https://tun.domain.com/v1/ns/5.6.7.8/53
+```
+
+### Create reverse TCP tunnel
+
+```
+POST /v1/rtcp
+```
+
+Allocates a port on the gateway. Connect to it with `nc`, and the DNS tunnel terminates there.
+
+```bash
+curl -X POST https://tun.domain.com/v1/rtcp
 ```
 
 ### Check tunnel status
