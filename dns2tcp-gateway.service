@@ -1,0 +1,26 @@
+[Unit]
+Description=DNS2TCP Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dns2tcp-gateway
+Restart=on-failure
+RestartSec=5
+
+Environment=GATEWAY_DOMAIN=tun.domain.com
+Environment=GATEWAY_IP=127.0.0.1
+Environment=GATEWAY_DNS_ADDR=:53
+Environment=GATEWAY_API_ADDR=:443
+Environment=GATEWAY_TLS=true
+Environment=LOG_LEVEL=info
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dns2tcp
+
+[Install]
+WantedBy=multi-user.target

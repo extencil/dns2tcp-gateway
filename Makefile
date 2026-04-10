@@ -1,6 +1,6 @@
 .PHONY: build run test lint clean
 
-BINARY := dns2tcp
+BINARY := dns2tcp-gateway
 PKG := ./cmd/dns2tcp
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")

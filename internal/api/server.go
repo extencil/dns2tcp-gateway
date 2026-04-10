@@ -5,10 +5,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/time/rate"
 
 	"github.com/ohmymex/dns2tcp-gateway/internal/config"
 	"github.com/ohmymex/dns2tcp-gateway/internal/relay"
@@ -107,7 +110,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 }
 
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
-	return s.logMiddleware(next)
+	return s.logMiddleware(s.rateLimitMiddleware(next))
 }
 
 func (s *Server) logMiddleware(next http.Handler) http.Handler {
@@ -136,4 +139,71 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// ipLimiter tracks per IP rate limiters.
+// 10 requests per second with a burst of 20.
+// Stale entries are cleaned up every 5 minutes.
+type ipLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*visitorLimiter
+}
+
+type visitorLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+func newIPLimiter() *ipLimiter {
+	il := &ipLimiter{
+		limiters: make(map[string]*visitorLimiter),
+	}
+	go il.cleanup()
+	return il
+}
+
+func (il *ipLimiter) get(ip string) *rate.Limiter {
+	il.mu.Lock()
+	defer il.mu.Unlock()
+
+	v, ok := il.limiters[ip]
+	if !ok {
+		limiter := rate.NewLimiter(10, 20)
+		il.limiters[ip] = &visitorLimiter{limiter: limiter, lastSeen: time.Now()}
+		return limiter
+	}
+	v.lastSeen = time.Now()
+	return v.limiter
+}
+
+func (il *ipLimiter) cleanup() {
+	for {
+		time.Sleep(5 * time.Minute)
+		il.mu.Lock()
+		for ip, v := range il.limiters {
+			if time.Since(v.lastSeen) > 10*time.Minute {
+				delete(il.limiters, ip)
+			}
+		}
+		il.mu.Unlock()
+	}
+}
+
+var limiter = newIPLimiter()
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+
+		if !limiter.get(ip).Allow() {
+			s.logger.Warn("rate limited", "remote", ip)
+			http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
