@@ -37,10 +37,13 @@ const (
 	// in case the sweep goroutine is delayed.
 	DrainWait = 600 * time.Millisecond
 
-	// flushTrigger: when the gap between nextDispatchSeq and an incoming
-	// seq exceeds this, preemptively NOP old USED slots to prevent ring
-	// saturation. Matches C server's QUEUE_SIZE/4.
-	flushTrigger = QueueSize / 4
+	// headGracePeriod is how long to wait after the first query before
+	// dispatching data. Through public resolvers like Cloudflare, queries
+	// from the same batch arrive out of order (higher seq first). This
+	// grace period lets the full initial batch assemble so we can pick
+	// the lowest seq as the head, preventing data from going to the wrong
+	// seq. Only applies once at session start.
+	headGracePeriod = 50 * time.Millisecond
 )
 
 // slotStatus tracks the lifecycle of a seq slot in the ring.
@@ -106,8 +109,9 @@ type Client struct {
 	// Head of the seq window. Next seq that should receive data.
 	// Advances forward as slots are replied and evicted.
 	nextDispatchSeq uint16
-	headReady       bool // false until first query sets nextDispatchSeq
-	dispatching     bool // true after first data dispatch, locks head direction
+	headReady       bool      // false until first query sets nextDispatchSeq
+	dispatching     bool      // true after first data dispatch, locks head direction
+	headGraceUntil  time.Time // no dispatch until this time (lets initial batch assemble)
 
 	// Evicted reply cache: seq -> packet. For Cloudflare retries of seqs
 	// that have already been advanced past in the ring.
@@ -204,6 +208,18 @@ func (c *Client) tryDispatch() {
 		return
 	}
 
+	// Grace period: let the initial batch assemble before dispatching.
+	// Through Cloudflare, queries arrive out of order. Without this,
+	// a higher-seq query arriving first becomes head and gets data
+	// meant for a lower seq.
+	if !c.headGraceUntil.IsZero() {
+		if time.Now().Before(c.headGraceUntil) {
+			return
+		}
+		// Grace period expired. Finalize head to the lowest seq in ring.
+		c.finalizeHead()
+	}
+
 	for {
 		slot, ok := c.ring[c.nextDispatchSeq]
 		if !ok || slot.status != slotUsed {
@@ -270,6 +286,30 @@ func (c *Client) advanceHead() {
 	}
 }
 
+// finalizeHead sets nextDispatchSeq to the lowest seq in the ring.
+// Called once after the grace period expires to ensure the head is correct
+// regardless of which query arrived first through the resolver.
+// Must be called with c.mu held.
+func (c *Client) finalizeHead() {
+	c.headGraceUntil = time.Time{} // clear grace
+
+	if len(c.ring) == 0 {
+		return
+	}
+
+	// Find the lowest seq in the ring.
+	first := true
+	var lowest uint16
+	for seq := range c.ring {
+		if first || seqBefore(seq, lowest) {
+			lowest = seq
+			first = false
+		}
+	}
+	c.nextDispatchSeq = lowest
+	c.logger.Debug("head finalized", "seq", lowest, "ring_size", len(c.ring))
+}
+
 // expirySweep runs in a background goroutine. Every sweepInterval (100ms),
 // it NOP's any USED slot older than slotExpiry (500ms) and advances the head.
 // This matches the C server's queue_flush_expired_data behavior.
@@ -329,42 +369,6 @@ func (c *Client) pruneDispatched() {
 			}
 		}
 	}
-}
-
-// flushOldSlots preemptively NOP's USED slots when the seq gap from head
-// is too large, preventing ring saturation. Matches C server's FLUSH_TRIGGER.
-// Must be called with c.mu held.
-func (c *Client) flushOldSlots(incomingSeq uint16) {
-	if !c.headReady {
-		return
-	}
-	gap := incomingSeq - c.nextDispatchSeq
-	if gap <= flushTrigger {
-		return
-	}
-
-	// NOP the oldest gap/2 USED slots.
-	count := int(gap) / 2
-	flushed := 0
-	for seq := c.nextDispatchSeq; flushed < count; seq++ {
-		slot, ok := c.ring[seq]
-		if !ok {
-			continue
-		}
-		if slot.status != slotUsed {
-			continue
-		}
-		nop := &protocol.Packet{
-			SessionID: c.SessionID,
-			Seq:       seq,
-			AckSeq:    0,
-			Type:      protocol.TypeACK | protocol.TypeNOP,
-		}
-		c.logger.Debug("flush trigger NOP", "seq", seq, "gap", gap)
-		c.replySlot(slot, nop)
-		flushed++
-	}
-	c.advanceHead()
 }
 
 // makeDataPacket consumes a chunk from pendingData and returns a DATA packet.
@@ -520,11 +524,14 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		}
 	}
 
-	// Initialize head from first query. Adjust downward if a lower seq
-	// arrives before the first dispatch (Cloudflare reordering).
+	// Initialize head from first query with grace period. Through public
+	// resolvers, the first query to arrive may not be the lowest seq.
+	// The grace period lets the full initial batch assemble so finalizeHead
+	// can pick the true lowest seq.
 	if !c.headReady {
 		c.nextDispatchSeq = clientSeq
 		c.headReady = true
+		c.headGraceUntil = time.Now().Add(headGracePeriod)
 	} else if !c.dispatching && seqBefore(clientSeq, c.nextDispatchSeq) {
 		diff := c.nextDispatchSeq - clientSeq
 		if diff < QueueSize {
@@ -570,9 +577,6 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		result:    result,
 		arrivedAt: time.Now(),
 	}
-
-	// Flush old slots if seq gap is too large.
-	c.flushOldSlots(clientSeq)
 
 	// Inline dispatch: if this seq is the head and data is ready, dispatch now.
 	c.tryDispatch()
