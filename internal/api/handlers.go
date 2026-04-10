@@ -123,7 +123,7 @@ func (s *Server) handleCreateRTCP(w http.ResponseWriter, r *http.Request) {
 		RTCPPort:  rtcpSess.Port,
 		CreatedAt: sess.CreatedAt.Format(time.RFC3339),
 		ExpiresAt: sess.ExpiresAt.Format(time.RFC3339),
-		Message:   fmt.Sprintf("use 'nc %s %d'. DNS tunnel to %s will terminate here.", s.cfg.GatewayIP, rtcpSess.Port, fqdn),
+		Message:   fmt.Sprintf("use 'nc %s %d'. DNS tunnel to %s will terminate here.", s.cfg.Domain, rtcpSess.Port, fqdn),
 	})
 }
 
