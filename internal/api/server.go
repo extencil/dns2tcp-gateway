@@ -141,9 +141,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// ipLimiter tracks per IP rate limiters.
-// 10 requests per second with a burst of 20.
-// Stale entries are cleaned up every 5 minutes.
+/* per-IP rate limiter: 10 req/s, burst 20, stale cleanup every 5m */
 type ipLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*visitorLimiter

@@ -137,14 +137,11 @@ func (m *Manager) handleResource(ctx context.Context, pkt *protocol.Packet, subd
 	if client == nil {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
-	// Through public resolvers, =resource can arrive before auth step 2.
-	// Wait briefly for auth to complete.
+	/* public resolvers can reorder: =resource may arrive before auth step 2 */
 	if !client.WaitAuthed(500 * time.Millisecond) {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
 
-	// Build resource list. The subdomain identifies the REST API session
-	// which contains the target IP:PORT.
 	resourceList := m.buildResourceList(ctx, subdomain)
 
 	return &protocol.Packet{
@@ -159,9 +156,7 @@ func (m *Manager) handleConnect(ctx context.Context, pkt *protocol.Packet, subdo
 	if client == nil {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
-	// Through public resolvers like Cloudflare, =connect can arrive before
-	// the auth step 2 HMAC response. The client sends them ~200ms apart but
-	// Cloudflare can reorder. Wait briefly for auth to complete.
+	/* public resolvers can reorder: =connect may arrive before auth step 2 */
 	if !client.WaitAuthed(500 * time.Millisecond) {
 		return m.errPacket(pkt.SessionID, "not authenticated"), nil
 	}
@@ -169,8 +164,6 @@ func (m *Manager) handleConnect(ctx context.Context, pkt *protocol.Packet, subdo
 	resourceName := string(pkt.Payload)
 	client.Resource = resourceName
 
-	// Resolve target using the subdomain from the DNS query.
-	// The subdomain maps to a REST API session that has the target IP:PORT.
 	target := m.resolveResource(ctx, subdomain)
 	if target == "" {
 		m.logger.Warn("resource not found", "resource", resourceName, "subdomain", subdomain, "session_id", pkt.SessionID)
@@ -206,9 +199,6 @@ func (m *Manager) handleData(pkt *protocol.Packet) (*protocol.Packet, error) {
 		}, nil
 	}
 
-	// If the packet carries data, forward it to the TCP backend.
-	// HandleData marks the seq as seen internally.
-	// For NOP queries, mark seen separately so flushIncoming can skip NOP gaps.
 	if pkt.IsData() && len(pkt.Payload) > 0 {
 		if err := client.HandleData(pkt.Seq, pkt.Payload); err != nil {
 			m.logger.Debug("data forward failed", "error", err, "session_id", pkt.SessionID)
@@ -217,7 +207,6 @@ func (m *Manager) handleData(pkt *protocol.Packet) (*protocol.Packet, error) {
 		client.MarkNOPSeen(pkt.Seq)
 	}
 
-	// Drain pending TCP data into the DNS response.
 	return client.DrainPending(pkt.Seq, MaxPayloadSize), nil
 }
 

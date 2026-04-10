@@ -15,34 +15,24 @@ const (
 	// QueueSize matches dns2tcp's QUEUE_SIZE (max pending queries per client).
 	QueueSize = 48
 
-	// MaxPayloadSize is the max raw bytes that can fit in a single DNS response
-	// after accounting for headers, base64 expansion, and DNS overhead.
-	MaxPayloadSize = 100
-
-	// ReadBufferSize is the TCP read buffer size.
+	MaxPayloadSize = 100 // max raw bytes per DNS response after headers + base64 + overhead
 	ReadBufferSize = 4096
 
-	// slotExpiry is how long a USED slot waits before getting a NOP reply.
-	// The C server uses REQUEST_UTIMEOUT = 500ms. We use 500ms to match.
-	// This must be shorter than Cloudflare's retry interval (~500ms) so
-	// queries get NOP'd before the resolver retries, and well under the
-	// SERVFAIL threshold (~3s).
-	slotExpiry = 500 * time.Millisecond
+	/*
+	 * slotExpiry: how long a USED slot waits before NOP reply.
+	 * Matches C server's REQUEST_UTIMEOUT = 500ms. Must be shorter than
+	 * Cloudflare's retry interval (~500ms) and well under SERVFAIL (~3s).
+	 */
+	slotExpiry    = 500 * time.Millisecond
+	sweepInterval = 100 * time.Millisecond // expiry ticker interval
+	DrainWait     = 600 * time.Millisecond // safety-net timeout, sweep should NOP first
 
-	// sweepInterval is how often the expiry ticker runs.
-	sweepInterval = 100 * time.Millisecond
-
-	// DrainWait is the safety-net timeout for DrainPending. The expiry
-	// sweep should always NOP a slot before this fires. This is a fallback
-	// in case the sweep goroutine is delayed.
-	DrainWait = 600 * time.Millisecond
-
-	// headGracePeriod is how long to wait after the first query before
-	// dispatching data. Through public resolvers like Cloudflare, queries
-	// from the same batch arrive out of order (higher seq first). This
-	// grace period lets the full initial batch assemble so we can pick
-	// the lowest seq as the head, preventing data from going to the wrong
-	// seq. Only applies once at session start.
+	/*
+	 * headGracePeriod: delay before first dispatch at session start.
+	 * Through public resolvers, queries from the same batch arrive out
+	 * of order (higher seq first). This lets the full batch assemble so
+	 * finalizeHead can pick the lowest seq. Only applies once.
+	 */
 	headGracePeriod = 50 * time.Millisecond
 )
 
@@ -54,12 +44,12 @@ const (
 	slotReplied                   // response sent, cached for retries
 )
 
-// seqSlot represents a DNS query sitting in the seq window, waiting for
-// TCP data or expiry. This replaces the old drainSlot + batch sort design.
-//
-// Lifecycle: USED (query arrives) -> REPLIED (data/NOP dispatched)
-// After head advances past a REPLIED slot, the reply moves to the
-// dispatched cache and the slot is deleted from the ring.
+/*
+ * seqSlot: a DNS query in the seq window, waiting for TCP data or expiry.
+ * Lifecycle: USED (query arrives) -> REPLIED (data/NOP dispatched).
+ * After head advances past a REPLIED slot, the reply moves to the
+ * dispatched cache and the slot is deleted from the ring.
+ */
 type seqSlot struct {
 	status    slotStatus
 	seq       uint16
@@ -69,23 +59,17 @@ type seqSlot struct {
 	arrivedAt time.Time
 }
 
-// Client represents an authenticated dns2tcp tunnel client.
-//
-// Server-to-client data flow (rewritten to match C server architecture):
-//
-//	DNS query arrives -> DrainPending:
-//	  - Retry for replied/evicted seq: return cached response
-//	  - New seq: place in ring[seq], try inline dispatch from head
-//
-//	TCP data arrives -> readLoop buffers in pendingData -> tryDispatch from head
-//
-//	Expiry sweep (100ms ticker):
-//	  - NOP any USED slot older than 500ms (C server's queue_flush_expired_data)
-//	  - Advance head past replied/expired slots
-//
-// The ring is a map keyed by seq number. nextDispatchSeq tracks the head
-// (lowest seq that should receive the next data chunk). This mirrors the
-// C server's positional ring buffer without needing offset arithmetic.
+/*
+ * Client: an authenticated dns2tcp tunnel client.
+ *
+ * Data flow (mirrors C server architecture):
+ *   DNS query -> DrainPending: retry = cached response, new = ring[seq] + inline dispatch
+ *   TCP data  -> readLoop buffers -> tryDispatch from head forward
+ *   100ms tick -> sweep old USED slots with NOP -> advance head
+ *
+ * Ring is a map keyed by seq. nextDispatchSeq is the head (lowest seq
+ * that gets the next data chunk), matching C server's positional ring.
+ */
 type Client struct {
 	mu        sync.Mutex
 	SessionID uint16
@@ -95,35 +79,21 @@ type Client struct {
 	authedCh  chan struct{} // closed when IsAuthed becomes true
 	Resource  string
 
-	// TCP connection to the backend resource.
-	tcpConn net.Conn
-
-	// Pending response data read from the TCP backend.
+	tcpConn     net.Conn
 	pendingData []byte
+	connecting  bool // guards concurrent ConnectTCP
 
-	// Guards against concurrent ConnectTCP calls.
-	connecting bool
+	ring            map[uint16]*seqSlot    // active query slots by seq
+	nextDispatchSeq uint16                 // head: next seq to receive data
+	headReady       bool                   // set on first query
+	dispatching     bool                   // locked after first data dispatch
+	headGraceUntil  time.Time              // initial batch assembly window
+	dispatched      map[uint16]*protocol.Packet // evicted reply cache for retries
 
-	// Seq window: active query slots keyed by seq number.
-	ring map[uint16]*seqSlot
-
-	// Head of the seq window. Next seq that should receive data.
-	// Advances forward as slots are replied and evicted.
-	nextDispatchSeq uint16
-	headReady       bool      // false until first query sets nextDispatchSeq
-	dispatching     bool      // true after first data dispatch, locks head direction
-	headGraceUntil  time.Time // no dispatch until this time (lets initial batch assemble)
-
-	// Evicted reply cache: seq -> packet. For Cloudflare retries of seqs
-	// that have already been advanced past in the ring.
-	dispatched map[uint16]*protocol.Packet
-
-	// Stop signal for expiry sweep goroutine.
 	stopSweep chan struct{}
 	sweepOnce sync.Once
 
-	// Incoming data queue: client data arrives out of order through DNS
-	// resolvers. Buffer by seq and flush to TCP in order.
+	/* incoming data: buffered by seq, flushed to TCP in order */
 	incomingBuf   map[uint16][]byte
 	nextIncomSeq  uint16
 	incomSeqReady bool
@@ -176,7 +146,6 @@ func (c *Client) ConnectTCP(target string) error {
 	return nil
 }
 
-// readLoop reads data from the TCP backend and tries to dispatch.
 func (c *Client) readLoop() {
 	buf := make([]byte, ReadBufferSize)
 	for {
@@ -202,18 +171,13 @@ func (c *Client) readLoop() {
 	}
 }
 
-// tryDispatch dispatches pending data to USED slots starting from the head
-// (nextDispatchSeq) and cascading forward through consecutive USED slots.
-// Must be called with c.mu held.
+// tryDispatch: dispatch data from head forward. Must hold c.mu.
 func (c *Client) tryDispatch() {
 	if !c.headReady {
 		return
 	}
 
-	// Grace period: let the initial batch assemble before dispatching.
-	// Through Cloudflare, queries arrive out of order. Without this,
-	// a higher-seq query arriving first becomes head and gets data
-	// meant for a lower seq.
+	/* grace period: let initial batch assemble before dispatching */
 	if !c.headGraceUntil.IsZero() {
 		if time.Now().Before(c.headGraceUntil) {
 			return
@@ -250,8 +214,7 @@ func (c *Client) tryDispatch() {
 	}
 }
 
-// replySlot sends a packet to the slot's result channel and marks it REPLIED.
-// Must be called with c.mu held.
+// replySlot: send packet to slot and mark REPLIED. Must hold c.mu.
 func (c *Client) replySlot(slot *seqSlot, pkt *protocol.Packet) {
 	slot.reply = pkt
 	slot.status = slotReplied
@@ -261,9 +224,7 @@ func (c *Client) replySlot(slot *seqSlot, pkt *protocol.Packet) {
 	}
 }
 
-// advanceHead moves nextDispatchSeq past all non-USED slots (REPLIED or
-// missing), evicting replied slots to the dispatched cache.
-// Must be called with c.mu held.
+// advanceHead: move past REPLIED/missing slots, evict to cache. Must hold c.mu.
 func (c *Client) advanceHead() {
 	for {
 		slot, ok := c.ring[c.nextDispatchSeq]
@@ -288,10 +249,7 @@ func (c *Client) advanceHead() {
 	}
 }
 
-// finalizeHead sets nextDispatchSeq to the lowest seq in the ring.
-// Called once after the grace period expires to ensure the head is correct
-// regardless of which query arrived first through the resolver.
-// Must be called with c.mu held.
+// finalizeHead: set head to lowest seq in ring after grace period. Must hold c.mu.
 func (c *Client) finalizeHead() {
 	c.headGraceUntil = time.Time{} // clear grace
 
@@ -312,9 +270,7 @@ func (c *Client) finalizeHead() {
 	c.logger.Debug("head finalized", "seq", lowest, "ring_size", len(c.ring))
 }
 
-// expirySweep runs in a background goroutine. Every sweepInterval (100ms),
-// it NOP's any USED slot older than slotExpiry (500ms) and advances the head.
-// This matches the C server's queue_flush_expired_data behavior.
+// expirySweep: background NOP for old USED slots (C server's queue_flush_expired_data).
 func (c *Client) expirySweep() {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
@@ -331,8 +287,7 @@ func (c *Client) expirySweep() {
 	}
 }
 
-// doSweep expires old USED slots and advances the head.
-// Must be called with c.mu held.
+// doSweep: expire old USED slots, advance head. Must hold c.mu.
 func (c *Client) doSweep() {
 	now := time.Now()
 	for seq, slot := range c.ring {
@@ -353,16 +308,12 @@ func (c *Client) doSweep() {
 	}
 	c.advanceHead()
 
-	// Prune old dispatched cache entries. Keep at most QueueSize*2 entries.
 	if len(c.dispatched) > QueueSize*2 {
 		c.pruneDispatched()
 	}
 }
 
-// pruneDispatched removes the oldest entries from the dispatched cache.
-// Must be called with c.mu held.
 func (c *Client) pruneDispatched() {
-	// Find the lowest seq in dispatched and remove entries far behind head.
 	for seq := range c.dispatched {
 		if seqBefore(seq, c.nextDispatchSeq) {
 			diff := c.nextDispatchSeq - seq
@@ -373,8 +324,7 @@ func (c *Client) pruneDispatched() {
 	}
 }
 
-// makeDataPacket consumes a chunk from pendingData and returns a DATA packet.
-// Must be called with c.mu held.
+// makeDataPacket: consume chunk from pendingData. Must hold c.mu.
 func (c *Client) makeDataPacket(seq uint16, maxBytes int) *protocol.Packet {
 	n := len(c.pendingData)
 	if n > maxBytes {
@@ -395,7 +345,7 @@ func (c *Client) makeDataPacket(seq uint16, maxBytes int) *protocol.Packet {
 	}
 }
 
-// MarkNOPSeen records that a NOP query (no payload) with this seq was received.
+// MarkNOPSeen: record NOP query seq so flushIncoming can skip gaps.
 func (c *Client) MarkNOPSeen(seq uint16) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -418,8 +368,7 @@ func (c *Client) MarkNOPSeen(seq uint16) {
 	}
 }
 
-// HandleData buffers incoming client data indexed by seq, then flushes to
-// the TCP backend in order.
+// HandleData: buffer incoming client data by seq, flush to TCP in order.
 func (c *Client) HandleData(seq uint16, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -467,8 +416,7 @@ func (c *Client) HandleData(seq uint16, data []byte) error {
 	return c.flushIncoming()
 }
 
-// flushIncoming writes buffered client data to TCP in seq order.
-// Must be called with c.mu held.
+// flushIncoming: write buffered data to TCP in seq order. Must hold c.mu.
 func (c *Client) flushIncoming() error {
 	for {
 		if data, ok := c.incomingBuf[c.nextIncomSeq]; ok {
@@ -496,9 +444,10 @@ func seqBefore(a, b uint16) bool {
 	return int16(a-b) < 0
 }
 
-// DrainPending registers a query in the seq window and waits for the
-// dispatcher or expiry sweep to reply. Retries for already-dispatched
-// seqs return the cached response immediately.
+/*
+ * DrainPending: register query in seq window, wait for data or expiry NOP.
+ * Retries for already-dispatched seqs return cached response immediately.
+ */
 func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 	c.mu.Lock()
 
@@ -526,10 +475,7 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		}
 	}
 
-	// Initialize head from first query with grace period. Through public
-	// resolvers, the first query to arrive may not be the lowest seq.
-	// The grace period lets the full initial batch assemble so finalizeHead
-	// can pick the true lowest seq.
+	/* init head with grace period; first arrival may not be lowest seq */
 	if !c.headReady {
 		c.nextDispatchSeq = clientSeq
 		c.headReady = true
@@ -541,7 +487,6 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		}
 	}
 
-	// Reject seqs too far behind head (stale retries not in cache).
 	if c.dispatching && seqBefore(clientSeq, c.nextDispatchSeq) {
 		c.mu.Unlock()
 		c.logger.Debug("stale seq behind head, NOP", "seq", clientSeq, "head", c.nextDispatchSeq)
@@ -553,7 +498,6 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		}
 	}
 
-	// Already have a USED slot for this seq (duplicate arrival before reply).
 	if existing, ok := c.ring[clientSeq]; ok && existing.status == slotUsed {
 		c.mu.Unlock()
 		// Wait on the existing slot's result channel.
@@ -570,7 +514,6 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		}
 	}
 
-	// Place new slot in the ring.
 	result := make(chan *protocol.Packet, 1)
 	c.ring[clientSeq] = &seqSlot{
 		status:    slotUsed,
@@ -580,7 +523,6 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 		arrivedAt: time.Now(),
 	}
 
-	// Inline dispatch: if this seq is the head and data is ready, dispatch now.
 	c.tryDispatch()
 
 	c.mu.Unlock()
@@ -589,7 +531,7 @@ func (c *Client) DrainPending(clientSeq uint16, maxBytes int) *protocol.Packet {
 	case pkt := <-result:
 		return pkt
 	case <-time.After(DrainWait):
-		// Safety net. The expiry sweep should have NOP'd this slot already.
+		/* safety net: sweep should have NOP'd already */
 		c.mu.Lock()
 		if slot, ok := c.ring[clientSeq]; ok && slot.status == slotUsed {
 			nop := &protocol.Packet{
@@ -644,10 +586,7 @@ func (c *Client) Close() {
 	}
 }
 
-// SetAuthed marks the client as authenticated and unblocks any goroutines
-// waiting in WaitAuthed. Through public resolvers like Cloudflare, the
-// =connect query can arrive before the auth step 2 HMAC response. This
-// signaling mechanism lets handleConnect wait for auth to complete.
+// SetAuthed: mark authenticated, unblock WaitAuthed callers.
 func (c *Client) SetAuthed() {
 	c.mu.Lock()
 	c.IsAuthed = true
@@ -655,8 +594,7 @@ func (c *Client) SetAuthed() {
 	close(c.authedCh)
 }
 
-// WaitAuthed blocks until the client is authenticated or the timeout expires.
-// Returns true if authenticated, false if timed out.
+// WaitAuthed: block until authenticated or timeout. Returns true if authed.
 func (c *Client) WaitAuthed(timeout time.Duration) bool {
 	c.mu.Lock()
 	if c.IsAuthed {
